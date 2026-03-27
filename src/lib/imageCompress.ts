@@ -55,3 +55,26 @@ export async function fileToCompressedDataUrl(
     img.src = url
   })
 }
+
+/**
+ * 写入 localStorage 前将封面地址转为可持久化形式：
+ * - `blob:` 仅当前页会话有效，刷新后失效 → 转为压缩后的 data URL
+ * - `data:` / `http(s):` 原样返回
+ */
+export async function persistableImageUrl(url: string | undefined): Promise<string | undefined> {
+  if (!url) return undefined
+  if (url.startsWith('data:')) return url
+  if (url.startsWith('http://') || url.startsWith('https://')) return url
+  if (url.startsWith('blob:')) {
+    try {
+      const res = await fetch(url)
+      const blob = await res.blob()
+      const type = blob.type && blob.type.startsWith('image/') ? blob.type : 'image/jpeg'
+      const file = new File([blob], 'cover.jpg', { type })
+      return await fileToCompressedDataUrl(file)
+    } catch {
+      return undefined
+    }
+  }
+  return url
+}

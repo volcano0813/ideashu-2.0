@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { persistableImageUrl } from '../lib/imageCompress'
 import {
   addStyleSampleFromPost,
   consumePendingPublish,
@@ -17,6 +18,7 @@ function formatPreview(text: string) {
 export default function PendingPublishConfirmPage() {
   const navigate = useNavigate()
   const [pending] = useState<PendingPublish | null>(() => consumePendingPublish())
+  const [saving, setSaving] = useState(false)
 
   const previewBody = useMemo(() => (pending ? formatPreview(pending.draft.body) : ''), [pending])
 
@@ -28,7 +30,7 @@ export default function PendingPublishConfirmPage() {
         <div className="mt-4">
           <button
             type="button"
-            onClick={() => navigate('/')}
+            onClick={() => navigate('/workspace')}
             className="px-4 py-2 rounded-lg bg-primary text-white font-semibold hover:bg-primary/90 transition-colors"
           >
             返回编辑器
@@ -42,25 +44,32 @@ export default function PendingPublishConfirmPage() {
 
   const coverUrl = pendingNN.draft.cover.imageUrl
 
-  function confirmSave() {
-    const now = new Date().toISOString()
-    const id = pendingNN.id || uidForPost()
-    const post = {
-      id,
-      status: pendingNN.status,
-      title: pendingNN.draft.title,
-      body: pendingNN.draft.body,
-      tags: pendingNN.draft.tags,
-      cover: pendingNN.draft.cover,
-      originalDraft: pendingNN.originalDraft,
-      editHistory: pendingNN.editHistory,
-      createdAt: pendingNN.createdAt || now,
-      updatedAt: now,
-    }
+  async function confirmSave() {
+    if (saving) return
+    setSaving(true)
+    try {
+      const now = new Date().toISOString()
+      const id = pendingNN.id || uidForPost()
+      const storedImageUrl = await persistableImageUrl(pendingNN.draft.cover.imageUrl)
+      const post = {
+        id,
+        status: pendingNN.status,
+        title: pendingNN.draft.title,
+        body: pendingNN.draft.body,
+        tags: pendingNN.draft.tags,
+        cover: { ...pendingNN.draft.cover, imageUrl: storedImageUrl },
+        originalDraft: pendingNN.originalDraft,
+        editHistory: pendingNN.editHistory,
+        createdAt: pendingNN.createdAt || now,
+        updatedAt: now,
+      }
 
-    savePost(post)
-    addStyleSampleFromPost(post)
-    navigate('/knowledge-base')
+      savePost(post)
+      addStyleSampleFromPost(post)
+      navigate('/knowledge-base')
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -122,17 +131,18 @@ export default function PendingPublishConfirmPage() {
           <div className="mt-4 flex gap-3 flex-wrap">
             <button
               type="button"
-              onClick={() => navigate('/')}
+              onClick={() => navigate('/workspace')}
               className="px-4 py-2 rounded-lg border border-border-muted text-text-secondary font-semibold hover:border-primary/40 hover:text-primary transition-colors"
             >
               返回编辑器
             </button>
             <button
               type="button"
-              onClick={confirmSave}
-              className="px-4 py-2 rounded-lg bg-primary text-white font-semibold hover:bg-primary/90 transition-colors"
+              disabled={saving}
+              onClick={() => void confirmSave()}
+              className="px-4 py-2 rounded-lg bg-primary text-white font-semibold hover:bg-primary/90 transition-colors disabled:opacity-60"
             >
-              确认保存到作品集
+              {saving ? '保存中…' : '确认保存到作品集'}
             </button>
           </div>
         </div>

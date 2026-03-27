@@ -15,7 +15,104 @@ export type TrendSignal = {
   timing?: string
   timingDetail?: string
   materialMatch?: boolean
-  materialCount?: number
+    materialCount?: number
+  /** ideashu-v5 optional trace URL (normalized in `sources[].url` when valid) */
+  sourceUrl?: string
+  /** ISO date when the linked article was published (if provided by API) */
+  publishedAt?: string
+}
+
+function isHttpOrHttpsUrlString(s: string): boolean {
+  try {
+    const u = new URL(s.trim())
+    return u.protocol === 'http:' || u.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+/** True if the signal has a verifiable http(s) link on `sourceUrl` or any `sources[].url`. */
+export function hasTraceableHttpsUrl(sig: TrendSignal): boolean {
+  const top = typeof sig.sourceUrl === 'string' ? sig.sourceUrl.trim() : ''
+  if (top && isHttpOrHttpsUrlString(top)) return true
+  for (const s of sig.sources ?? []) {
+    const u = typeof s?.url === 'string' ? s.url.trim() : ''
+    if (u && isHttpOrHttpsUrlString(u)) return true
+  }
+  return false
+}
+
+/** Hotspot pipeline: drop topics without a traceable URL (avoids loose/table fake cards). */
+export function filterTrendSignalsWithTraceableUrl(signals: TrendSignal[]): TrendSignal[] {
+  return signals.filter(hasTraceableHttpsUrl)
+}
+
+/** Hostnames that indicate docs/help fallbacks, not verifiable news/event sources. */
+const HOTSPOT_META_DOC_HOSTS = new Set(['docs.openclaw.ai'])
+
+function collectTraceableHttpsUrls(sig: TrendSignal): string[] {
+  const out: string[] = []
+  const top = typeof sig.sourceUrl === 'string' ? sig.sourceUrl.trim() : ''
+  if (top && isHttpOrHttpsUrlString(top)) out.push(top)
+  for (const s of sig.sources ?? []) {
+    const u = typeof s?.url === 'string' ? s.url.trim() : ''
+    if (u && isHttpOrHttpsUrlString(u)) out.push(u)
+  }
+  return out
+}
+
+/**
+ * True when the signal is a Skill/gateway "cannot search" row that still satisfies https traceability
+ * (e.g. only links to docs.openclaw.ai), or matches limitation copy + doc link.
+ */
+export function isHotspotMetaLimitationSignal(sig: TrendSignal): boolean {
+  const urls = collectTraceableHttpsUrls(sig)
+  const textBlob = [sig.title, sig.topicSource, sig.hook, sig.angle].filter(Boolean).join('\n')
+  if (urls.length === 0) {
+    // 无链接时仍可能是「缺 BRAVE / 请粘贴链接」整段说明被误解析成一条选题
+    return (
+      /BRAVE_API_KEY|Brave\s*API|无法调用实时搜索工具|缺少\s*BRAVE|系统限制说明|来源[：:]\s*系统限制|无法提供实时|需要搜索权限|搜索权限或手动|请粘贴您|粘贴您.*链接/i.test(
+        textBlob,
+      ) || /系统限制说明|来源[：:]\s*系统限制/.test(String(sig.topicSource ?? '').trim())
+    )
+  }
+
+  const hosts = urls.map((u) => {
+    try {
+      return new URL(u).hostname.toLowerCase()
+    } catch {
+      return ''
+    }
+  }).filter(Boolean)
+
+  const onlyMetaDocHosts =
+    hosts.length > 0 && hosts.every((h) => HOTSPOT_META_DOC_HOSTS.has(h))
+
+  const limitationWording =
+    /无法提供实时|需要搜索权限|搜索权限或手动|手动提供信源/.test(textBlob) ||
+    /系统限制说明|来源[：:]\s*系统限制/.test(textBlob) ||
+    /BRAVE_API_KEY|Brave\s*API|无法调用实时搜索工具|缺少\s*BRAVE/i.test(textBlob)
+  const limitationSourceField = /系统限制说明|^系统限制$/.test(String(sig.topicSource ?? '').trim())
+
+  if (onlyMetaDocHosts) return true
+  if (limitationWording && limitationSourceField) return true
+  if (limitationWording && hosts.some((h) => HOTSPOT_META_DOC_HOSTS.has(h))) return true
+
+  return false
+}
+
+/** Traceable https only, then drop meta/limitation rows (docs-only or explicit failure copy). */
+export function filterTrendSignalsForHotspotUi(signals: TrendSignal[]): TrendSignal[] {
+  return filterTrendSignalsWithTraceableUrl(signals).filter((s) => !isHotspotMetaLimitationSignal(s))
+}
+
+function finishTopicsWithTraceableFilter(norm: TrendSignal[] | null): TrendSignal[] | null {
+  if (!norm || norm.length === 0) return null
+  const strict = filterTrendSignalsForHotspotUi(norm)
+  if (strict.length > 0) return strict
+  // 助手常漏填 sourceUrl：宁可展示无链接卡片（HotCard 内提示补链），也不要整页失败
+  const relaxed = norm.filter((s) => !isHotspotMetaLimitationSignal(s))
+  return relaxed.length > 0 ? relaxed : null
 }
 
 export type StyleRule = {
@@ -27,14 +124,25 @@ export type StyleRule = {
   createdAt: string
 }
 
+/** ideashu-v5 `json:cover` after Kolors (SiliconFlow) image generation */
+export type CoverPayload = {
+  mode: 'text2img' | 'img2img'
+  imageUrl: string
+  overlayText?: string
+  prompt?: string
+  strength?: number
+  iteration?: number
+}
+
 export type OpenClawEvent =
   | { type: 'topics'; topics: TrendSignal[] }
   | { type: 'draft'; draft: Draft }
+  | { type: 'cover'; cover: CoverPayload }
   | { type: 'score'; score: QualityScore }
   | { type: 'originality'; originality: OriginalityReport }
   | { type: 'style_rules'; rules: StyleRule[] }
-  /** Natural-language part of assistant reply (```json:*``` fences removed) for chat UI. */
-  | { type: 'assistant_reply'; replyId: string; text: string }
+  /** Natural-language part of assistant reply (```json:*``` fences removed) for chat UI. `rawFull` is the unmodified assistant body for parsers (e.g. Hotspot). */
+  | { type: 'assistant_reply'; replyId: string; text: string; rawFull?: string }
 
 export type OpenClawClient = {
   connect: () => Promise<void>
@@ -42,6 +150,8 @@ export type OpenClawClient = {
   /** Plain user text to Gateway (same as Feishu client). No client-side business suffixes. */
   send: (content: string) => void
   onEvent: (cb: (evt: OpenClawEvent) => void) => () => void
+  /** Latest assistant prose (for StrictMode remount / missed React state sync). Cleared on send/connect/disconnect. */
+  getLastAssistantReply: () => Extract<OpenClawEvent, { type: 'assistant_reply' }> | null
   /** True when WebSocket is connected and session has a sessionKey for chat.send. */
   isReady: () => boolean
   onConnectionChange: (cb: (ready: boolean) => void) => () => void
@@ -53,6 +163,10 @@ function safeParseJSON(raw: string): unknown | null {
   } catch {
     return null
   }
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function stripCodeFences(s: string) {
@@ -145,9 +259,19 @@ function extractTaggedJSON(raw: string, tag: string): unknown | null {
   let skip = plain.length
   if (idx < 0) {
     idx = raw.indexOf(fenced)
-    if (idx < 0) return null
-    skip = fenced.length
+    if (idx < 0) {
+      const flex = new RegExp(`json\\s*:\\s*${escapeRegExp(tag)}`, 'i')
+      const m = flex.exec(raw)
+      if (m) {
+        idx = m.index
+        skip = m[0].length
+      }
+    } else {
+      skip = fenced.length
+    }
   }
+
+  if (idx < 0) return null
 
   let rest = raw.slice(idx + skip).trim()
   rest = rest.replace(/^[:\s]+/, '')
@@ -184,16 +308,18 @@ function parseJsonSnippet(rest: string): unknown | null {
   return safeParseJSON(r.slice(first, last + 1))
 }
 
-const JSON_BLOCK_TAGS = ['topics', 'draft', 'score', 'originality', 'style_rules'] as const
+const JSON_BLOCK_TAGS = ['topics', 'draft', 'cover', 'score', 'originality', 'style_rules'] as const
 
 function emitFromParsedJson(tag: string, raw: unknown, emit: (evt: OpenClawEvent) => void) {
   switch (tag) {
     case 'topics': {
       const topicsNorm = normalizeTrendSignals(raw)
       if (topicsNorm) {
+        const forUi = finishTopicsWithTraceableFilter(topicsNorm)
+        if (!forUi || forUi.length === 0) break
         // eslint-disable-next-line no-console
         console.log('[openclawClient] parsed json:topics')
-        emit({ type: 'topics', topics: topicsNorm })
+        emit({ type: 'topics', topics: forUi })
       }
       break
     }
@@ -203,6 +329,15 @@ function emitFromParsedJson(tag: string, raw: unknown, emit: (evt: OpenClawEvent
         // eslint-disable-next-line no-console
         console.log('[openclawClient] parsed json:draft')
         emit({ type: 'draft', draft: draftNorm })
+      }
+      break
+    }
+    case 'cover': {
+      const coverNorm = normalizeCoverPayload(raw)
+      if (coverNorm) {
+        // eslint-disable-next-line no-console
+        console.log('[openclawClient] parsed json:cover')
+        emit({ type: 'cover', cover: coverNorm })
       }
       break
     }
@@ -240,7 +375,12 @@ function emitFromParsedJson(tag: string, raw: unknown, emit: (evt: OpenClawEvent
  */
 function extractJsonBlocks(text: string): Record<string, unknown> {
   const result: Record<string, unknown> = {}
-  const patterns = [/```json:(\w+)\s*\n([\s\S]*?)```/g, /```json:(\w+)\s*([\s\S]*?)```/g]
+  const patterns = [
+    /```json:(\w+)\s*\n([\s\S]*?)```/g,
+    /```json:(\w+)\s*([\s\S]*?)```/g,
+    /```\s*json\s*:\s*(\w+)\s*\n([\s\S]*?)```/gi,
+    /```\s*json\s*:\s*(\w+)\s*([\s\S]*?)```/gi,
+  ]
   for (const regex of patterns) {
     regex.lastIndex = 0
     let match: RegExpExecArray | null
@@ -264,6 +404,230 @@ function extractJsonBlocks(text: string): Record<string, unknown> {
   return result
 }
 
+/**
+ * Some models emit a bare ```json ... ``` array (no :topics tag) for topic lists.
+ */
+function topicsArrayFromParsedBareJson(parsed: unknown): unknown[] | null {
+  if (Array.isArray(parsed) && parsed.length > 0) {
+    const first = parsed[0]
+    if (!first || typeof first !== 'object') return null
+    const o = first as Record<string, unknown>
+    if (typeof o.title !== 'string') return null
+    return parsed
+  }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const topics = (parsed as Record<string, unknown>).topics
+    if (Array.isArray(topics) && topics.length > 0) {
+      const first = topics[0]
+      if (first && typeof first === 'object' && typeof (first as Record<string, unknown>).title === 'string') {
+        return topics
+      }
+    }
+  }
+  return null
+}
+
+function extractBareJsonTopicsArray(text: string): unknown[] | null {
+  const patterns = [/```json\s*\n([\s\S]*?)```/gi, /```json\s+([\s\S]*?)```/gi]
+  for (const regex of patterns) {
+    regex.lastIndex = 0
+    let match: RegExpExecArray | null
+    while ((match = regex.exec(text)) !== null) {
+      const inner = match[1].trim()
+      if (!inner) continue
+      try {
+        const parsed = JSON.parse(inner)
+        const arr = topicsArrayFromParsedBareJson(parsed)
+        if (arr) return arr
+      } catch {
+        const recovered = parseJsonSnippet(inner)
+        if (recovered != null) {
+          const arr = topicsArrayFromParsedBareJson(recovered)
+          if (arr) return arr
+        }
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Last-resort: find a JSON array in prose (e.g. model pasted array without fences) where objects have `title`.
+ */
+function tryExtractJsonArrayFromText(text: string): unknown[] | null {
+  if (text.length > 120000) return null
+  if (!/"title"\s*:/.test(text)) return null
+  for (let end = text.length - 1; end >= 0; end--) {
+    if (text[end] !== ']') continue
+    let depth = 0
+    let start = -1
+    for (let j = end; j >= 0; j--) {
+      const c = text[j]
+      if (c === ']') depth++
+      else if (c === '[') {
+        depth--
+        if (depth === 0) {
+          start = j
+          break
+        }
+      }
+    }
+    if (start < 0) continue
+    const slice = text.slice(start, end + 1)
+    try {
+      const parsed = JSON.parse(slice)
+      const arr = topicsArrayFromParsedBareJson(parsed)
+      if (arr) return arr
+    } catch {
+      continue
+    }
+  }
+  return null
+}
+
+/**
+ * When the model returns a GFM table (e.g. 热点 / 钩子 / 为什么火) instead of ```json:topics```,
+ * map rows into TrendSignal-shaped objects for normalizeTrendSignals.
+ */
+function parseMarkdownHotspotTable(text: string): unknown[] | null {
+  const lines = text.split(/\r?\n/)
+  const tableRows: string[][] = []
+  let collecting = false
+  for (const line of lines) {
+    const t = line.trim()
+    const isRow = t.startsWith('|') && t.endsWith('|')
+    if (!isRow) {
+      if (collecting && tableRows.length >= 2) break
+      continue
+    }
+    collecting = true
+    const inner = t.slice(1, -1)
+    const cells = inner.split('|').map((c) => c.trim())
+    if (cells.length === 0) continue
+    if (cells.every((c) => /^[\s\-:|｜]+$/.test(c) || /^:?[\s\-:]+:?$/.test(c.trim()))) continue
+    tableRows.push(cells)
+  }
+  if (tableRows.length < 2) return null
+
+  const isSeparatorRow = (cells: string[]) =>
+    cells.every((c) => /^:?[\s\-:]+:?$/.test(c.trim()) || /^[\s\-:|]+$/.test(c))
+  const filtered = tableRows.filter((row) => !isSeparatorRow(row))
+  if (filtered.length < 2) return null
+
+  const header = filtered[0]!
+  const headerNorm = header.map((h) => h.replace(/\s+/g, ''))
+  const findIdx = (re: RegExp) => headerNorm.findIndex((h) => re.test(h))
+  let titleIdx = findIdx(/热点|选题|标题|话题|方向|主题/)
+  if (titleIdx < 0) titleIdx = 0
+  const hookIdx = findIdx(/钩子|hook|文案|切入/)
+  const whyIdx = findIdx(/火|原因|为什么|说明|价值|爆/)
+
+  const out: unknown[] = []
+  for (let r = 1; r < filtered.length; r++) {
+    const cells = filtered[r]!
+    const title = (cells[titleIdx] ?? cells[0] ?? '').trim()
+    if (!title || /^[:：\-—|｜\s]+$/.test(title)) continue
+    const hook = hookIdx >= 0 ? (cells[hookIdx] ?? '').trim() : ''
+    const why = whyIdx >= 0 ? (cells[whyIdx] ?? '').trim() : ''
+    const angles = [hook, why].filter((s) => s.length > 0)
+    const metrics = angles.length > 0 ? angles.join(' · ') : '—'
+    out.push({
+      id: `topic_${out.length}`,
+      title,
+      keyword: title,
+      heatScore: 72,
+      lifecycle: 'hot',
+      sources: [{ platform: '助手热点表', metrics }],
+      suggestedAngles: angles.length > 0 ? angles : ['切入', '展开'],
+    })
+  }
+  return out.length > 0 ? out : null
+}
+
+function isNoiseHotspotTitle(t: string): boolean {
+  const s = t.replace(/\*\*/g, '').trim()
+  if (s.length < 2 || s.length > 100) return true
+  if (/请告诉我|请直接|我不再回复|继续重复同样|^\d+\s*[.)）]\s*请/.test(s)) return true
+  if (/你不需要更多|不需要更多[「"]找热点/.test(s)) return true
+  if (/^请选|^点选|^下一步|^告诉我\s*(现在)?$/.test(s)) return true
+  if (/^关于\s*[「"']?/.test(s) || /：\s*$/.test(s)) return true
+  if (/我已多次|收到你的消息|完整\s*完整/.test(s)) return true
+  if (/专属选题方案|选题方案$/.test(s)) return true
+  if (/\d+\s*个\s*(热点|选题)/.test(s) || /个热点角度\s*$/.test(s)) return true
+  return false
+}
+
+/**
+ * Assistant sometimes returns prose + bullet/checkmark lists (no JSON, no pipe table).
+ * Extract list lines as weak TrendSignals so Hotspot can render cards.
+ */
+function parseLooseHotspotList(text: string): unknown[] | null {
+  const lines = text.split(/\r?\n/)
+  const seen = new Set<string>()
+  const out: unknown[] = []
+
+  const pushTitle = (raw: string) => {
+    let t = raw.replace(/\*\*/g, '').replace(/^[「"'`]+/, '').replace(/[」"'`]+$/, '').trim()
+    t = t.replace(/^[\s\-–—·]+/, '').trim()
+    if (!t || isNoiseHotspotTitle(t)) return
+    const key = t.replace(/\s+/g, ' ')
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push({
+      id: `topic_${out.length}`,
+      title: t,
+      keyword: t,
+      heatScore: 62,
+      lifecycle: 'hot' as const,
+      sources: [{ platform: '助手摘要', metrics: '文本抽取' }],
+      suggestedAngles: ['结合账号定位展开', '补一条真实体验'],
+    })
+  }
+
+  const listItemRe =
+    /^\s*(?:[-*•]+|\d+[.、．)）]\s*|✅+\s*|☑\s*)(?:\[[ xX✓]\]\s*)?(.+)$/
+
+  for (const line of lines) {
+    const trimmed = line.trim()
+    const m = trimmed.match(listItemRe)
+    if (m?.[1]) {
+      pushTitle(m[1])
+      if (out.length >= 16) break
+    }
+  }
+
+  if (out.length === 0) {
+    let inSection = false
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (/^#{1,3}\s+/.test(trimmed)) {
+        inSection =
+          /热点|选题|清单|角度|方向|榜单|排行|日咖|版本/.test(trimmed) && !/请告诉我|不需要/.test(trimmed)
+        continue
+      }
+      if (trimmed.length < 60 && /\*\*[^*]+\*\*/.test(trimmed)) {
+        if (/热点|选题|清单|角度|方向|版本/.test(trimmed)) {
+          inSection = true
+          continue
+        }
+      }
+      if (/最简\d*热点|热点清单|\d+\s*个(选题|热点|版本)|选题角度|具体选题/.test(trimmed)) {
+        inSection = true
+        continue
+      }
+      if (inSection) {
+        const m = trimmed.match(listItemRe)
+        if (m?.[1]) {
+          pushTitle(m[1])
+          if (out.length >= 16) break
+        }
+      }
+    }
+  }
+
+  return out.length > 0 ? out : null
+}
+
 function emitJsonBlocksFromBuffer(fullText: string, emit: (evt: OpenClawEvent) => void) {
   const blocks = extractJsonBlocks(fullText)
   const seen = new Set<string>()
@@ -277,6 +641,28 @@ function emitJsonBlocksFromBuffer(fullText: string, emit: (evt: OpenClawEvent) =
     const raw = extractTaggedJSON(fullText, tag)
     if (raw == null) continue
     emitFromParsedJson(tag, raw, emit)
+    seen.add(tag)
+  }
+  if (!seen.has('topics')) {
+    const bare = extractBareJsonTopicsArray(fullText)
+    if (bare != null) {
+      emitFromParsedJson('topics', bare, emit)
+    } else {
+      const fromText = tryExtractJsonArrayFromText(fullText)
+      if (fromText != null) {
+        emitFromParsedJson('topics', fromText, emit)
+      } else {
+        const table = parseMarkdownHotspotTable(fullText)
+        if (table != null && table.length > 0) {
+          emitFromParsedJson('topics', table, emit)
+        } else {
+          const loose = parseLooseHotspotList(fullText)
+          if (loose != null && loose.length > 0) {
+            emitFromParsedJson('topics', loose, emit)
+          }
+        }
+      }
+    }
   }
 }
 
@@ -286,16 +672,21 @@ function clamp(n: number, min: number, max: number) {
 
 const COVER_TYPES = new Set(['photo', 'text', 'collage', 'compare', 'list'])
 
+function platformFromHostname(hostname: string): string {
+  const h = hostname.toLowerCase()
+  if (h.includes('xiaohongshu') || h.includes('xhslink')) return '小红书'
+  if (h.includes('weibo.com') || h === 'weibo.cn') return '微博'
+  if (h.includes('douyin') || h.includes('iesdouyin')) return '抖音'
+  if (h.includes('zhihu')) return '知乎'
+  if (h.includes('bilibili')) return 'B站'
+  return hostname || '链接'
+}
+
 function rowLooksLikeIdeashuV5Topics(o: Record<string, unknown>): boolean {
   if (typeof o.materialMatch === 'boolean') return true
   const timing = o.timing
   if (typeof timing === 'string' && (timing === 'hot' || timing === 'evergreen')) return true
-  if (
-    typeof o.source === 'string' &&
-    o.source.length > 0 &&
-    typeof o.angle === 'string' &&
-    typeof o.title === 'string'
-  ) {
+  if (typeof o.source === 'string' && o.source.length > 0 && typeof o.title === 'string') {
     return true
   }
   return false
@@ -309,8 +700,19 @@ function normalizeTrendSignals(raw: unknown): TrendSignal[] | null {
   }
   if (!arr || arr.length === 0) return null
 
+  function publishedAtFrom(o: Record<string, unknown>) {
+    const raw =
+      typeof o.publishedAt === 'string'
+        ? o.publishedAt.trim()
+        : typeof o.sourcePublishedAt === 'string'
+          ? o.sourcePublishedAt.trim()
+          : ''
+    return raw.length > 0 ? raw : undefined
+  }
+
   return arr.map((item, i) => {
     const o = item && typeof item === 'object' ? (item as Record<string, unknown>) : {}
+    const publishedAtOpt = publishedAtFrom(o)
     const id =
       typeof o.id === 'string' && o.id.length > 0
         ? o.id
@@ -330,18 +732,62 @@ function normalizeTrendSignals(raw: unknown): TrendSignal[] | null {
       const materialCount = typeof mc === 'number' ? mc : Number(mc)
       const materialCountNorm = Number.isFinite(materialCount) ? materialCount : 0
 
+      const heatFromO = typeof o.heatScore === 'number' ? o.heatScore : Number(o.heatScore)
+      const heatScore =
+        Number.isFinite(heatFromO) ? clamp(heatFromO, 0, 100) : materialMatch ? 88 : 58
+
+      const lifecycleRawV5 = typeof o.lifecycle === 'string' ? o.lifecycle.trim() : ''
+      const lifecycleFromJson: TrendSignal['lifecycle'] | null = [
+        'emerging',
+        'hot',
+        'peak',
+        'declining',
+      ].includes(lifecycleRawV5)
+        ? (lifecycleRawV5 as TrendSignal['lifecycle'])
+        : null
       const lifecycle: TrendSignal['lifecycle'] =
-        timing === 'evergreen' ? 'peak' : timing === 'hot' ? 'hot' : 'emerging'
+        lifecycleFromJson ??
+        (timing === 'evergreen' ? 'peak' : timing === 'hot' ? 'hot' : 'emerging')
 
       const angles = [angle, hook, timingDetail].map((s) => s.trim()).filter((s) => s.length > 0)
+
+      let sourceUrlRaw = typeof o.sourceUrl === 'string' ? o.sourceUrl.trim() : ''
+      const sourceStr = String(o.source ?? '').trim()
+      if (!sourceUrlRaw && /^https?:\/\//i.test(sourceStr)) {
+        try {
+          const u = new URL(sourceStr)
+          if (u.protocol === 'http:' || u.protocol === 'https:') sourceUrlRaw = u.href
+        } catch {
+          // ignore
+        }
+      }
+      let sources: TrendSignal['sources'] = []
+      let normalizedSourceUrl: string | undefined
+
+      if (sourceUrlRaw) {
+        try {
+          const u = new URL(sourceUrlRaw)
+          if (u.protocol === 'http:' || u.protocol === 'https:') {
+            normalizedSourceUrl = u.href
+            const looksLikeUrl = /^https?:\/\//i.test(source.trim())
+            const platformFromField =
+              source.trim().length > 0 && !looksLikeUrl ? source.trim() : platformFromHostname(u.hostname)
+            const metricsParts = [angle, hook].map((s) => s.trim()).filter((s) => s.length > 0)
+            const metrics = metricsParts.length > 0 ? metricsParts.join(' · ') : source || '—'
+            sources = [{ platform: platformFromField, url: u.href, metrics }]
+          }
+        } catch {
+          // invalid URL: leave sources empty
+        }
+      }
 
       return {
         id,
         keyword: title,
         title,
-        heatScore: materialMatch ? 88 : 58,
+        heatScore,
         lifecycle,
-        sources: [{ platform: '热点来源', metrics: source || '—' }],
+        sources,
         suggestedAngles: angles.length > 0 ? angles : ['切入角度', '钩子'],
         topicSource: source,
         angle: angle || undefined,
@@ -350,6 +796,8 @@ function normalizeTrendSignals(raw: unknown): TrendSignal[] | null {
         timingDetail: timingDetail || undefined,
         materialMatch,
         materialCount: materialCountNorm,
+        ...(normalizedSourceUrl ? { sourceUrl: normalizedSourceUrl } : {}),
+        ...(publishedAtOpt ? { publishedAt: publishedAtOpt } : {}),
       }
     }
 
@@ -363,9 +811,36 @@ function normalizeTrendSignals(raw: unknown): TrendSignal[] | null {
     )
       ? (lifecycleRaw as TrendSignal['lifecycle'])
       : 'hot'
-    const sources: TrendSignal['sources'] = Array.isArray(o.sources)
-      ? (o.sources as TrendSignal['sources'])
+    let sources: TrendSignal['sources'] = Array.isArray(o.sources)
+      ? (o.sources as TrendSignal['sources']).map((s) => ({ ...s }))
       : [{ platform: '小红书', metrics: '—' }]
+    const sourceUrlTop = typeof o.sourceUrl === 'string' ? o.sourceUrl.trim() : ''
+    let legacySourceUrl: string | undefined
+    if (sourceUrlTop) {
+      try {
+        const u = new URL(sourceUrlTop)
+        if (u.protocol === 'http:' || u.protocol === 'https:') {
+          legacySourceUrl = u.href
+          const first = sources[0] ?? { platform: '小红书', metrics: '—' }
+          const hasUrl = typeof first.url === 'string' && first.url.trim().length > 0
+          if (!hasUrl) {
+            sources = [
+              {
+                ...first,
+                url: u.href,
+                platform:
+                  typeof first.platform === 'string' && first.platform.trim().length > 0
+                    ? first.platform
+                    : platformFromHostname(u.hostname),
+              },
+              ...sources.slice(1),
+            ]
+          }
+        }
+      } catch {
+        // ignore invalid URL
+      }
+    }
     const angles = Array.isArray(o.suggestedAngles)
       ? (o.suggestedAngles as unknown[]).map((a) => String(a))
       : ['细节切入', '可复用步骤']
@@ -377,8 +852,96 @@ function normalizeTrendSignals(raw: unknown): TrendSignal[] | null {
       lifecycle,
       sources,
       suggestedAngles: angles,
+      ...(legacySourceUrl ? { sourceUrl: legacySourceUrl } : {}),
+      ...(publishedAtOpt ? { publishedAt: publishedAtOpt } : {}),
     }
   })
+}
+
+/** Hotspot / UI fallback when `topics` event was not emitted but prose still contains machine JSON. */
+export function parseTopicsFromAssistantRaw(raw: string): TrendSignal[] | null {
+  const blocks = extractJsonBlocks(raw)
+  if (blocks.topics !== undefined) {
+    return finishTopicsWithTraceableFilter(normalizeTrendSignals(blocks.topics))
+  }
+  const bare = extractBareJsonTopicsArray(raw)
+  if (bare) return finishTopicsWithTraceableFilter(normalizeTrendSignals(bare))
+  const tagged = extractTaggedJSON(raw, 'topics')
+  if (tagged != null) return finishTopicsWithTraceableFilter(normalizeTrendSignals(tagged))
+  const looseArr = tryExtractJsonArrayFromText(raw)
+  if (looseArr) return finishTopicsWithTraceableFilter(normalizeTrendSignals(looseArr))
+  const table = parseMarkdownHotspotTable(raw)
+  if (table != null && table.length > 0) return finishTopicsWithTraceableFilter(normalizeTrendSignals(table))
+  const loose = parseLooseHotspotList(raw)
+  if (loose != null && loose.length > 0) return finishTopicsWithTraceableFilter(normalizeTrendSignals(loose))
+  return null
+}
+
+function assistantTextFromRecord(obj: Record<string, unknown>): string {
+  const parts: string[] = []
+  if (typeof obj.text === 'string') parts.push(obj.text)
+  if (typeof obj.content === 'string') parts.push(obj.content)
+  if (typeof obj.delta === 'string') parts.push(obj.delta)
+  if (typeof obj.output === 'string') parts.push(obj.output)
+  const partList = obj.parts
+  if (Array.isArray(partList)) {
+    for (const part of partList) {
+      if (part && typeof part === 'object') {
+        const pr = part as Record<string, unknown>
+        if (typeof pr.text === 'string') parts.push(pr.text)
+        if (typeof pr.content === 'string') parts.push(pr.content)
+      }
+    }
+  }
+  return parts.join('')
+}
+
+/**
+ * Single agent/chunk frame: one canonical text slice (delta or cumulative per gateway).
+ */
+function extractAgentChunkText(payload: unknown): string {
+  if (payload == null || typeof payload !== 'object') return ''
+  const p = payload as Record<string, unknown>
+
+  const data = p.data
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    const s = assistantTextFromRecord(data as Record<string, unknown>)
+    if (s.length > 0) return s
+  }
+
+  if (typeof p.text === 'string') return p.text
+  if (typeof p.message === 'string') return p.message
+  if (p.message && typeof p.message === 'object') {
+    const msg = assistantTextFromRecord(p.message as Record<string, unknown>)
+    if (msg.length > 0) return msg
+  }
+  return ''
+}
+
+/**
+ * Chat completion frame may include both a short `data` slice and a full `message` body.
+ * Prefer the longest non-empty candidate so we do not parse a 4-char buffer while the full reply lives under `message`.
+ */
+function pickLongestAssistantTextFromChatPayload(payload: unknown): string {
+  if (payload == null || typeof payload !== 'object') return ''
+  const p = payload as Record<string, unknown>
+  const candidates: string[] = []
+  const push = (s: string) => {
+    const t = s.trim()
+    if (t.length > 0) candidates.push(s)
+  }
+
+  if (p.data && typeof p.data === 'object' && !Array.isArray(p.data)) {
+    push(assistantTextFromRecord(p.data as Record<string, unknown>))
+  }
+  if (typeof p.text === 'string') push(p.text)
+  if (typeof p.message === 'string') push(p.message)
+  if (p.message && typeof p.message === 'object') {
+    push(assistantTextFromRecord(p.message as Record<string, unknown>))
+  }
+
+  if (candidates.length === 0) return ''
+  return candidates.reduce((a, b) => (a.length >= b.length ? a : b))
 }
 
 function normalizeDraftPayload(raw: unknown): Draft | null {
@@ -386,16 +949,19 @@ function normalizeDraftPayload(raw: unknown): Draft | null {
   const o = raw as Record<string, unknown>
   let body: unknown = o.body
   if (Array.isArray(body)) body = (body as unknown[]).map((b) => String(b)).join('\n\n')
-  const bodyStr = String(body ?? '')
+  const sanitizeNoAsterisks = (s: string) => s.replace(/\*/g, '')
+  const bodyStr = sanitizeNoAsterisks(String(body ?? ''))
   const coverRaw =
     o.cover && typeof o.cover === 'object' ? (o.cover as Record<string, unknown>) : {}
   const t = String(coverRaw.type ?? 'photo')
   const coverType = COVER_TYPES.has(t) ? (t as Draft['cover']['type']) : 'photo'
   const status = o.status
   const draft: Draft = {
-    title: String(o.title ?? ''),
+    title: sanitizeNoAsterisks(String(o.title ?? '')),
     body: bodyStr,
-    tags: Array.isArray(o.tags) ? (o.tags as unknown[]).map((x) => String(x)) : [],
+    tags: Array.isArray(o.tags)
+      ? (o.tags as unknown[]).map((x) => sanitizeNoAsterisks(String(x)))
+      : [],
     cover: {
       type: coverType,
       description: String(coverRaw.description ?? ''),
@@ -418,6 +984,41 @@ function normalizeDraftPayload(raw: unknown): Draft | null {
     draft.materialAnchors = (o.materialAnchors as unknown[]).map((x) => String(x))
   }
   return draft
+}
+
+function normalizeCoverPayload(raw: unknown): CoverPayload | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  const imageUrl = typeof o.imageUrl === 'string' ? o.imageUrl.trim() : ''
+  if (!imageUrl) return null
+  try {
+    const u = new URL(imageUrl)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null
+  } catch {
+    return null
+  }
+  const modeRaw = String(o.mode ?? '')
+  const mode: CoverPayload['mode'] = modeRaw === 'img2img' ? 'img2img' : 'text2img'
+  const out: CoverPayload = { mode, imageUrl }
+  if (typeof o.overlayText === 'string' && o.overlayText.trim().length > 0) {
+    out.overlayText = o.overlayText.trim()
+  }
+  if (typeof o.prompt === 'string' && o.prompt.trim().length > 0) {
+    out.prompt = o.prompt.trim()
+  }
+  const st = o.strength
+  if (typeof st === 'number' && Number.isFinite(st)) out.strength = st
+  else if (typeof st === 'string') {
+    const n = Number(st)
+    if (Number.isFinite(n)) out.strength = n
+  }
+  const it = o.iteration
+  if (typeof it === 'number' && Number.isFinite(it)) out.iteration = it
+  else if (typeof it === 'string') {
+    const n = Number(it)
+    if (Number.isFinite(n)) out.iteration = n
+  }
+  return out
 }
 
 function normalizeQualityScore(raw: unknown): QualityScore | null {
@@ -484,9 +1085,9 @@ export function createOpenClawClient({
   let ws: WebSocket | null = null
   let connected = false
   let sessionKey: string | null = null
-  let operatorAuthPromise:
-    | Promise<{ gatewayToken: string; deviceToken: string } | null>
-    | null = null
+  /** Successful token load only; failed loads do not cache so the next connect can retry. */
+  let cachedOperatorAuth: { gatewayToken: string; deviceToken: string } | null = null
+  let operatorAuthInFlight: Promise<{ gatewayToken: string; deviceToken: string } | null> | null = null
 
   // pending request resolvers for gateway frames (type: "res")
   const pendingRes = new Map<
@@ -500,57 +1101,106 @@ export function createOpenClawClient({
   const eventListeners = new Set<(evt: OpenClawEvent) => void>()
   const connectionListeners = new Set<(ready: boolean) => void>()
 
+  /** When `assistant_reply` fires with zero listeners (e.g. React StrictMode gap), hold once for the next subscriber. */
+  let undeliveredAssistantReply: Extract<OpenClawEvent, { type: 'assistant_reply' }> | null = null
+
+  /** Survives component remounts so the UI can re-hydrate if StrictMode dropped setState. Cleared on send/connect/disconnect. */
+  let lastAssistantReplySnapshot: Extract<OpenClawEvent, { type: 'assistant_reply' }> | null = null
+
   function notifyConnectionChange(ready: boolean) {
     connectionListeners.forEach((cb) => cb(ready))
   }
 
   let debugEventLogged = 0
   let debugAgentExtractLogged = 0
-
-  // #region debug_mode_logging
-  // Runtime evidence logger (NDJSON via local ingest server).
-  const DEBUG_INGEST_URL = 'http://127.0.0.1:7242/ingest/a1565d14-fde7-4306-890c-ac1f808cce0c'
-  let debugIngestSent = 0
-  const DEBUG_INGEST_LIMIT = 500
+  let debugHealthLogged = 0
+  let debugChatSendLogged = 0
   let debugAgentChatIngestCount = 0
   let debugPayloadJsonMismatchIngestCount = 0
   let debugParsedJsonIngestCount = 0
-  let debugHealthLogged = 0
-  let debugChatSendLogged = 0
 
-  function postDebugLog(params: {
+  // #region debug_mode_logging
+  // Debug-only evidence logger (disabled by default for demo/production).
+  // The local ingest server may be unavailable, so we intentionally no-op here.
+  function postDebugLog(_params: {
     hypothesisId: string
     location: string
     message: string
     data?: Record<string, unknown>
     runId?: string
   }) {
-    if (debugIngestSent >= DEBUG_INGEST_LIMIT) return
-    debugIngestSent += 1
-
-    // Avoid sending huge payloads.
-    const data = params.data ?? {}
-    fetch(DEBUG_INGEST_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        runId: params.runId ?? undefined,
-        hypothesisId: params.hypothesisId,
-        location: params.location,
-        message: params.message,
-        data,
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {})
+    // no-op
   }
   // #endregion
 
   function emit(evt: OpenClawEvent) {
+    if (evt.type === 'assistant_reply') {
+      lastAssistantReplySnapshot = {
+        type: 'assistant_reply',
+        replyId: evt.replyId,
+        text: evt.text,
+        rawFull: evt.rawFull,
+      }
+      if (eventListeners.size === 0) {
+        undeliveredAssistantReply = evt
+        return
+      }
+      undeliveredAssistantReply = null
+    }
     eventListeners.forEach((cb) => cb(evt))
   }
 
   /** Full assistant reply text: agent chunks append `payload.data.text`; chat + `message` flushes and parses ```json:*``` blocks. */
   let messageBuffer = ''
+
+  /**
+   * Some gateways stream only `agent` events and never emit `chat` with `message`, so the buffer would
+   * never flush. Schedule a parse after the stream goes idle (last agent chunk).
+   */
+  let agentIdleFlushTimer: number | null = null
+  const AGENT_IDLE_FLUSH_MS = 2000
+
+  function clearAgentIdleFlushTimer() {
+    if (agentIdleFlushTimer != null) {
+      window.clearTimeout(agentIdleFlushTimer)
+      agentIdleFlushTimer = null
+    }
+  }
+
+  function scheduleAgentIdleFlush() {
+    clearAgentIdleFlushTimer()
+    agentIdleFlushTimer = window.setTimeout(() => {
+      agentIdleFlushTimer = null
+      if (!messageBuffer.trim()) return
+      parseAndEmitMessageBuffer('agent_stream_idle', activeAssistantReplyId)
+    }, AGENT_IDLE_FLUSH_MS)
+  }
+
+  /**
+   * If structured topic data is present (fenced ```json:topics```, bare ```json``` array, or pipe table),
+   * parse immediately instead of waiting for idle. Does not use parseLooseHotspotList — prose-only replies
+   * must not trigger an early flush from section headings.
+   */
+  function tryFlushAgentBufferIfTopicsFenceComplete() {
+    const text = messageBuffer
+    if (!text.trim() || text.length < 40) return
+    const blocks = extractJsonBlocks(text)
+    let payload: unknown = blocks.topics
+    if (payload === undefined) {
+      const bare = extractBareJsonTopicsArray(text)
+      if (bare) payload = bare
+    }
+    if (payload === undefined) {
+      const table = parseMarkdownHotspotTable(text)
+      if (table && table.length > 0) payload = table
+    }
+    if (payload === undefined) return
+    const norm = normalizeTrendSignals(payload)
+    if (!norm || norm.length === 0) return
+    const forUi = finishTopicsWithTraceableFilter(norm)
+    if (!forUi || forUi.length === 0) return
+    parseAndEmitMessageBuffer('agent_stream+json_topics_fence', activeAssistantReplyId)
+  }
 
   /** Same assistant body sometimes gets flushed twice (e.g. duplicate `chat` events); skip second emit. */
   let lastAssistantRawFingerprint: string | null = null
@@ -565,10 +1215,14 @@ export function createOpenClawClient({
   let activeAssistantReplyId: string | null = null
   let fallbackAssistantReplySeq = 0
 
+  /** Same visible prose after strip but `raw` grew (e.g. ```json:topics``` finished streaming) — still emit so Hotspot can parse final rawFull. */
+  const lastRawFullEmittedByReplyId = new Map<string, string>()
+
   function resetAssistantDedupe() {
     lastAssistantRawFingerprint = null
     lastAssistantDisplayFingerprint = null
     activeAssistantReplyId = null
+    lastRawFullEmittedByReplyId.clear()
   }
 
   function deriveReplyIdFromPayload(payload: unknown): string | null {
@@ -605,6 +1259,7 @@ export function createOpenClawClient({
   }
 
   function clearMessageBuffer() {
+    clearAgentIdleFlushTimer()
     messageBuffer = ''
   }
 
@@ -618,20 +1273,47 @@ export function createOpenClawClient({
     }
     lastAssistantRawFingerprint = fp
 
+    // Emit structured JSON-derived events first so Hotspot (and similar) can consume `topics`
+    // before `assistant_reply` and avoid treating a failed prose parse as final when json:topics
+    // is present in the same raw payload.
+    emitJsonBlocksFromBuffer(raw, emit)
+
     const displayText = stripMachineJsonFromChatDisplay(raw)
     const displayNorm = displayText.replace(/\s+/g, ' ').trim()
+    let emittedVisible = false
     if (displayNorm.length > 0) {
       const displayKey = `${replyId}::${displayNorm}`
-      if (displayKey === lastAssistantDisplayFingerprint) {
+      const prevRawForReply = lastRawFullEmittedByReplyId.get(replyId)
+      const rawGrew = prevRawForReply !== raw
+      if (displayKey === lastAssistantDisplayFingerprint && !rawGrew) {
         // eslint-disable-next-line no-console
-        console.warn('[openclawClient] skip duplicate assistant_reply (same visible text after strip, different raw)')
+        console.warn('[openclawClient] skip duplicate assistant_reply (same visible text after strip, same raw)')
       } else {
-        lastAssistantDisplayFingerprint = displayKey
-        emit({ type: 'assistant_reply', replyId, text: displayText })
+        if (displayKey !== lastAssistantDisplayFingerprint) {
+          lastAssistantDisplayFingerprint = displayKey
+        }
+        lastRawFullEmittedByReplyId.set(replyId, raw)
+        emittedVisible = true
+        emit({ type: 'assistant_reply', replyId, text: displayText, rawFull: raw })
       }
     }
 
-    emitJsonBlocksFromBuffer(raw, emit)
+    // Some skills reply with only machine-readable ```json:*``` blocks and no prose.
+    // In demo/production UX, show a minimal assistant bubble so users know something happened.
+    if (!emittedVisible) {
+      const hasMachineJson = /```json:\w+/.test(raw) || /\bjson:\w+\b/.test(raw)
+      if (hasMachineJson) {
+        const fallback = '已生成结果（草稿/评分/原创度已更新）。'
+        const displayKey = `${replyId}::${fallback}`
+        const prevRawForReply = lastRawFullEmittedByReplyId.get(replyId)
+        const rawGrew = prevRawForReply !== raw
+        if (displayKey !== lastAssistantDisplayFingerprint || rawGrew) {
+          lastAssistantDisplayFingerprint = displayKey
+          lastRawFullEmittedByReplyId.set(replyId, raw)
+          emit({ type: 'assistant_reply', replyId, text: fallback, rawFull: raw })
+        }
+      }
+    }
   }
 
   function parseCompleteAssistantTextFromPayload(
@@ -648,6 +1330,7 @@ export function createOpenClawClient({
   }
 
   function parseAndEmitMessageBuffer(reason: string, replyId: string | null) {
+    clearAgentIdleFlushTimer()
     const text = messageBuffer
     messageBuffer = ''
     if (!text.trim()) return
@@ -780,22 +1463,26 @@ export function createOpenClawClient({
   }
 
   async function loadOperatorToken(): Promise<{ gatewayToken: string; deviceToken: string } | null> {
-    if (operatorAuthPromise) return operatorAuthPromise
+    if (cachedOperatorAuth) return cachedOperatorAuth
+    if (operatorAuthInFlight) return operatorAuthInFlight
 
-    operatorAuthPromise = (async () => {
+    operatorAuthInFlight = (async () => {
       try {
         const resp = await fetch('/__openclaw_device_auth', { method: 'GET' })
         if (!resp.ok) return null
         const data = (await resp.json()) as any
         if (typeof data?.gatewayToken !== 'string') return null
         if (typeof data?.deviceToken !== 'string') return null
-        return { gatewayToken: data.gatewayToken, deviceToken: data.deviceToken }
+        cachedOperatorAuth = { gatewayToken: data.gatewayToken, deviceToken: data.deviceToken }
+        return cachedOperatorAuth
       } catch {
         return null
+      } finally {
+        operatorAuthInFlight = null
       }
     })()
 
-    return operatorAuthPromise
+    return operatorAuthInFlight
   }
 
   async function loadDeviceIdentityForConnect(params: {
@@ -863,6 +1550,8 @@ export function createOpenClawClient({
     sessionKey = null
     pendingRes.clear()
     clearMessageBuffer()
+    undeliveredAssistantReply = null
+    lastAssistantReplySnapshot = null
 
     ws = new WebSocket(url)
     const socket = ws
@@ -1049,12 +1738,7 @@ export function createOpenClawClient({
           const payload = frame.payload
 
           if (evtName === 'agent') {
-            const p = payload as Record<string, unknown> | null | undefined
-            const data = p?.data
-            const chunk =
-              data != null && typeof data === 'object' && !Array.isArray(data)
-                ? String((data as Record<string, unknown>).text ?? '')
-                : ''
+            const chunk = extractAgentChunkText(payload)
             const wasEmpty = messageBuffer.length === 0
             messageBuffer = mergeStreamTextChunk(messageBuffer, chunk)
             if (wasEmpty) {
@@ -1092,6 +1776,8 @@ export function createOpenClawClient({
                 })
               }
             } catch {}
+            tryFlushAgentBufferIfTopicsFenceComplete()
+            scheduleAgentIdleFlush()
             return
           }
 
@@ -1099,6 +1785,10 @@ export function createOpenClawClient({
             const p = payload as Record<string, unknown> | null | undefined
             const hasMessage = p != null && typeof p === 'object' && 'message' in p && p.message != null
             if (hasMessage) {
+              const fromChat = pickLongestAssistantTextFromChatPayload(payload)
+              if (fromChat.length > messageBuffer.length) {
+                messageBuffer = fromChat
+              }
               parseAndEmitMessageBuffer('chat+message', activeAssistantReplyId)
             }
             if (debugAgentExtractLogged < 40) {
@@ -1158,8 +1848,11 @@ export function createOpenClawClient({
   function disconnect() {
     connected = false
     sessionKey = null
+    cachedOperatorAuth = null
     pendingRes.clear()
     clearMessageBuffer()
+    undeliveredAssistantReply = null
+    lastAssistantReplySnapshot = null
     resetAssistantDedupe()
     try {
       ws?.close()
@@ -1186,6 +1879,8 @@ export function createOpenClawClient({
     }
 
     clearMessageBuffer()
+    undeliveredAssistantReply = null
+    lastAssistantReplySnapshot = null
     resetAssistantDedupe()
 
     // We use chat.send because it creates/uses the default gateway session.
@@ -1235,10 +1930,16 @@ export function createOpenClawClient({
     },
     onEvent: (cb) => {
       eventListeners.add(cb)
+      if (undeliveredAssistantReply) {
+        const pending = undeliveredAssistantReply
+        undeliveredAssistantReply = null
+        cb(pending)
+      }
       return () => {
         eventListeners.delete(cb)
       }
     },
+    getLastAssistantReply: () => lastAssistantReplySnapshot,
   }
 }
 

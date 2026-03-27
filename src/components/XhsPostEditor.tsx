@@ -1,10 +1,15 @@
 /* eslint-disable react-hooks/set-state-in-effect */
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { useActiveAccount } from '../contexts/ActiveAccountContext'
+import { generateCoverPreview } from '../lib/coverCanvas'
+import { persistableImageUrl } from '../lib/imageCompress'
 import {
+  addStyleSampleFromPost,
   saveDraftSession,
-  setPendingPublish,
+  savePost,
   uidForPost,
+  type KnowledgePost,
   type EditRecord,
 } from '../lib/ideashuStorage'
 
@@ -63,25 +68,53 @@ type Props = {
   gatewayDisconnected?: boolean
   /** Clear local draft session (used by WorkspacePage “重置草稿” button). */
   onResetDraftSession?: () => void
+  /** 用户点击「看我的修改规律」时由工作台发 Skill */
+  onRequestStyleAnalysis?: () => void
 }
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n))
 }
 
-function splitIntoParagraphs(text: string): string[] {
-  const normalized = (text ?? '').replace(/\r\n/g, '\n').trim()
-  if (!normalized) return ['']
-  return normalized.split(/\n\s*\n/g)
+/** 合并连续空行，避免 Skill 输出多换行时产生大量「空白段落」撑开版心 */
+function collapseConsecutiveEmptyLines(parts: string[]): string[] {
+  const out: string[] = []
+  for (const part of parts) {
+    if (part === '' && out.length > 0 && out[out.length - 1] === '') continue
+    out.push(part)
+  }
+  return out.length ? out : ['']
 }
 
-function splitIntoParagraphsForBodyEdit(text: string): string[] {
-  // Body edit: avoid `.trim()` so IME intermediate states don't get destroyed.
+/**
+ * 去掉夹在两条有内容段落之间的「空段落」——Skill 常用 \n\n 分段，会多出一个空行，
+ * 在按段渲染时就会变成很大的段间距。
+ */
+function dropEmptyParagraphGaps(parts: string[]): string[] {
+  if (parts.length <= 2) return parts
+  return parts.filter((p, i) => {
+    if (p !== '') return true
+    const prev = i > 0 ? parts[i - 1] : ''
+    const next = i < parts.length - 1 ? parts[i + 1] : ''
+    if (prev !== '' && next !== '') return false
+    return true
+  })
+}
+
+/** 与规格一致：正文按单行换行分段（保存/对比均用 \n） */
+function splitBodyLines(text: string): string[] {
   const normalized = (text ?? '').replace(/\r\n/g, '\n')
   if (!normalized) return ['']
-  const parts = normalized.split(/\n\s*\n/g)
-  // Avoid trailing empty paragraph from trailing newlines.
-  if (parts.length > 1 && parts[parts.length - 1] === '') parts.pop()
+  const merged = collapseConsecutiveEmptyLines(normalized.split('\n'))
+  const parts = dropEmptyParagraphGaps(merged)
+  return parts.length ? parts : ['']
+}
+
+function splitBodyLinesInput(text: string): string[] {
+  const normalized = (text ?? '').replace(/\r\n/g, '\n')
+  if (!normalized) return ['']
+  const merged = collapseConsecutiveEmptyLines(normalized.split('\n'))
+  const parts = dropEmptyParagraphGaps(merged)
   return parts.length ? parts : ['']
 }
 
@@ -89,147 +122,38 @@ function countChars(s: string) {
   return (s ?? '').length
 }
 
-function complianceFromUserPct(userMaterialPct: number): Compliance {
-  if (userMaterialPct >= 60) return 'safe'
-  if (userMaterialPct >= 45) return 'caution'
+/** 原创度展示用合规分档（与质检维度无关） */
+function complianceFromOriginalityDisplay(displayed: number): Compliance {
+  if (displayed >= 60) return 'safe'
+  if (displayed >= 40) return 'caution'
   return 'risk'
 }
 
-function complianceColor(c: Compliance) {
-  switch (c) {
-    case 'safe':
-      return { ring: '#22c55e', badge: 'bg-green-50 text-green-700 border-green-200' }
-    case 'caution':
-      return { ring: '#eab308', badge: 'bg-amber-50 text-amber-700 border-amber-200' }
-    case 'risk':
-      return { ring: '#ef4444', badge: 'bg-red-50 text-red-700 border-red-200' }
-  }
-}
+/** 段落简化改写率：相对 original 的 title+body，衡量 current 改动了多少（0~1） */
+export function calculateRewriteRatio(
+  original: { title: string; body: string },
+  current: { title: string; body: string },
+): number {
+  const originalParas = `${original.title}\n${original.body}`.split('\n').filter(Boolean)
+  const currentParas = `${current.title}\n${current.body}`.split('\n').filter(Boolean)
+  const currentTotal = currentParas.join('').length
+  if (currentTotal === 0) return 0
 
-function formatPct(n: number) {
-  return `${Math.round(clamp(n, 0, 100))}%`
-}
+  let changedChars = 0
+  currentParas.forEach((para, i) => {
+    if (i >= originalParas.length) {
+      changedChars += para.length
+    } else if (para !== originalParas[i]) {
+      const o = originalParas[i]!
+      let same = 0
+      for (let j = 0; j < Math.min(para.length, o.length); j++) {
+        if (para[j] === o[j]) same++
+      }
+      changedChars += para.length - same
+    }
+  })
 
-function computeQualityFromEditCount(editCount: number): QualityScore {
-  // Demo-only: higher edits => more risk (lower authentic, higher ai smell).
-  const t = clamp(editCount, 0, 20)
-  const hook = clamp(85 - t * 0.8, 0, 100)
-  const authentic = clamp(85 - t * 1.6, 0, 100)
-  const aiSmell = clamp(25 + t * 3.2, 0, 100)
-  const diversity = clamp(72 - t * 0.9, 0, 100)
-  const cta = clamp(78 - t * 0.6, 0, 100)
-  const platform = clamp(80 - t * 0.7, 0, 100)
-
-  const total = Math.round(
-    (hook + authentic + aiSmell + diversity + cta + platform) / 6,
-  )
-
-  const suggestions: string[] = []
-  if (authentic < 55) suggestions.push('补充你的真实细节与时间地点，让体验更具体。')
-  if (aiSmell > 60) suggestions.push('降低“模板化表达”，替换为你自己的口吻与比喻。')
-  if (hook < 60) suggestions.push('开头再强化一行“冲突/好奇点”，提高停留率。')
-  if (suggestions.length === 0) suggestions.push('当前文本结构与语气比较稳定，继续小范围微调即可。')
-
-  // The UI uses individual dims + optional total; we include total via platform-like fields elsewhere.
-  void total
-  return {
-    hook,
-    authentic,
-    aiSmell,
-    diversity,
-    cta,
-    platform,
-    suggestions,
-  }
-}
-
-function OriginalityRing({
-  userMaterialPct,
-  compliance,
-  size = 44,
-  onClick,
-}: {
-  userMaterialPct: number
-  compliance: Compliance
-  size?: number
-  onClick?: () => void
-}) {
-  const { ring } = complianceColor(compliance)
-  const stroke = 5
-  const r = (size - stroke) / 2
-  const c = 2 * Math.PI * r
-  const pct = clamp(userMaterialPct, 0, 100) / 100
-  const dash = c * pct
-  const rest = c - dash
-
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="relative inline-flex items-center justify-center"
-      aria-label="Originality indicator"
-    >
-      <svg width={size} height={size} className="block">
-        <circle
-          cx={size / 2}
-          cy={size / 2}
-          r={r}
-          stroke="#f0f0f0"
-          strokeWidth={stroke}
-          fill="transparent"
-        />
-        <circle
-          cx={size / 2}
-          cy={size / 2}
-          r={r}
-          stroke={ring}
-          strokeWidth={stroke}
-          fill="transparent"
-          strokeDasharray={`${dash} ${rest}`}
-          strokeLinecap="round"
-          transform={`rotate(-90 ${size / 2} ${size / 2})`}
-        />
-      </svg>
-      <div className="absolute inset-0 flex flex-col items-center justify-center leading-tight">
-        <div className="text-[11px] font-bold" style={{ color: ring }}>
-          {Math.round(userMaterialPct)}
-        </div>
-        <div className="text-[9px] font-bold text-text-secondary -mt-0.5">%</div>
-      </div>
-    </button>
-  )
-}
-
-function barFillColor(value: number) {
-  const v = clamp(value, 0, 100)
-  if (v >= 80) return '#00C853'
-  if (v >= 60) return '#FF9800'
-  return '#ff2442'
-}
-
-function Bar({
-  label,
-  value,
-}: {
-  label: string
-  value: number
-}) {
-  const v = clamp(value, 0, 100)
-  const fill = barFillColor(v)
-  return (
-    <div className="flex items-center gap-2.5">
-      <span className="w-14 shrink-0 text-xs font-medium text-text-secondary text-right">{label}</span>
-      <div className="flex-1 h-[5px] rounded-sm bg-[#F0F0F0] overflow-hidden">
-        <div
-          className="h-full rounded-sm transition-[width] duration-500"
-          style={{ width: `${v}%`, backgroundColor: fill }}
-        />
-      </div>
-      <span className="w-7 shrink-0 text-xs font-medium text-right tabular-nums" style={{ color: fill }}>
-        {Math.round(v)}
-      </span>
-    </div>
-  )
+  return changedChars / currentTotal
 }
 
 function AutoGrowParagraph({
@@ -253,16 +177,22 @@ function AutoGrowParagraph({
     const el = ref.current
     if (!el) return
     el.style.height = 'auto'
-    el.style.height = `${el.scrollHeight}px`
+    const h = el.scrollHeight
+    // 空段落仍占一行高度，避免浏览器 scrollHeight 过大导致段间距「空一截」
+    const blank = !value.trim()
+    el.style.height = `${blank ? Math.min(h, 18) : h}px`
   }, [value])
 
   return (
     <div
       className={
         modified
-          ? 'border-l-[3px] border-l-[#eab308] pl-2'
-          : 'border-l-[3px] border-l-transparent pl-2'
+          ? 'border-l-[3px] border-l-emerald-500 pl-2'
+          : 'border-l-[3px] border-l-[#e5e7eb] pl-2'
       }
+      // Allow paragraph editing to only scroll vertically.
+      // Body-level swipe delete uses the single right strip (not the textarea).
+      style={{ touchAction: 'pan-y' }}
     >
       <textarea
         ref={ref}
@@ -271,20 +201,138 @@ function AutoGrowParagraph({
         onCompositionStart={() => onCompositionStart?.()}
         onCompositionEnd={() => onCompositionEnd?.()}
         readOnly={readOnly}
-        className="w-full resize-none outline-none bg-transparent border-none p-0 text-[13px] leading-[1.55] text-text-main placeholder:text-text-secondary/70"
+        style={{ touchAction: 'pan-y' }}
+        className="w-full resize-none outline-none bg-transparent border-none p-0 text-[13px] leading-[1.45] text-text-main placeholder:text-text-secondary/70"
         rows={1}
       />
     </div>
   )
 }
 
-const COVER_OPTIONS: { type: CoverType; label: string }[] = [
-  { type: 'photo', label: '实拍图' },
-  { type: 'text', label: '文字封面' },
-  { type: 'collage', label: '拼图' },
-  { type: 'compare', label: '对比图' },
-  { type: 'list', label: '清单图' },
-]
+/** 正文整块右侧一条侧滑区；左滑或上下滑删除，按按下位置的纵向区间对应段落。 */
+function BodyParagraphsWithSideSwipe({
+  paragraphs,
+  readOnly,
+  modifiedParagraphs,
+  onChangeParagraph,
+  onDeleteParagraph,
+  onCompositionStart,
+  onCompositionEnd,
+}: {
+  paragraphs: string[]
+  readOnly: boolean
+  modifiedParagraphs: boolean[]
+  onChangeParagraph: (idx: number, next: string) => void
+  onDeleteParagraph: (idx: number) => void
+  onCompositionStart: () => void
+  onCompositionEnd: () => void
+}) {
+  const rowRefs = useRef<(HTMLDivElement | null)[]>([])
+  const draggingRef = useRef(false)
+  const startXRef = useRef(0)
+  const startYRef = useRef(0)
+  /** 与常见列表侧滑一致，略低一点便于触控命中 */
+  const deleteThresholdPx = 28
+
+  useEffect(() => {
+    rowRefs.current.length = paragraphs.length
+  }, [paragraphs.length])
+
+  function indexAtClientY(y: number): number | null {
+    let best: number | null = null
+    let bestDist = Infinity
+    for (let i = 0; i < paragraphs.length; i++) {
+      const el = rowRefs.current[i]
+      if (!el) continue
+      const r = el.getBoundingClientRect()
+      if (y >= r.top && y <= r.bottom) return i
+      const mid = (r.top + r.bottom) / 2
+      const d = Math.abs(y - mid)
+      if (d < bestDist) {
+        bestDist = d
+        best = i
+      }
+    }
+    return best
+  }
+
+  const textBlock = (
+    <div className="min-w-0 flex-1 flex flex-col gap-0">
+      {paragraphs.map((p, idx) => {
+        const modified = modifiedParagraphs[idx] ?? false
+        return (
+          <div key={idx} ref={(el) => { rowRefs.current[idx] = el }}>
+            <AutoGrowParagraph
+              value={p}
+              readOnly={readOnly}
+              modified={modified}
+              onChange={(next) => onChangeParagraph(idx, next)}
+              onCompositionStart={onCompositionStart}
+              onCompositionEnd={onCompositionEnd}
+            />
+          </div>
+        )
+      })}
+    </div>
+  )
+
+  if (readOnly) {
+    return textBlock
+  }
+
+  return (
+    <div className="flex min-w-0 items-stretch gap-0">
+      {textBlock}
+      <div
+        className="relative flex w-7 shrink-0 flex-col items-stretch border-l border-border-muted/60 bg-canvas/40"
+        style={{ touchAction: 'none' }}
+        aria-hidden
+        onPointerDown={(e) => {
+          draggingRef.current = true
+          startXRef.current = e.clientX
+          startYRef.current = e.clientY
+          try {
+            e.currentTarget.setPointerCapture(e.pointerId)
+          } catch {
+            // ignore
+          }
+        }}
+        onPointerUp={(e) => {
+          if (!draggingRef.current) return
+          draggingRef.current = false
+          const dx = e.clientX - startXRef.current
+          const dy = e.clientY - startYRef.current
+          const absDx = Math.abs(dx)
+          const absDy = Math.abs(dy)
+
+          // 左滑删除（略放宽纵向分量，避免窄条上误当成「纯纵向」）
+          const leftSwipe =
+            dx < 0 &&
+            absDx >= deleteThresholdPx &&
+            absDx >= absDy * 0.45
+          // 上下滑删除（▲▼ 提示）
+          const verticalSwipe =
+            absDy >= deleteThresholdPx &&
+            absDy >= absDx * 0.45
+
+          if (!leftSwipe && !verticalSwipe) return
+
+          const idx = indexAtClientY((startYRef.current + e.clientY) / 2)
+          if (idx !== null) onDeleteParagraph(idx)
+        }}
+        onPointerCancel={() => {
+          draggingRef.current = false
+        }}
+      >
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-0.5 py-1">
+          <span className="shrink-0 text-[8px] leading-none text-text-secondary/70">▲</span>
+          <div className="min-h-[12px] w-0.5 flex-1 rounded-full bg-text-secondary/35" />
+          <span className="shrink-0 text-[8px] leading-none text-text-secondary/70">▼</span>
+        </div>
+      </div>
+    </div>
+  )
+}
 
 export default function XhsPostEditor({
   stage = 1,
@@ -295,10 +343,12 @@ export default function XhsPostEditor({
   onSaveToKB: _onSaveToKB,
   onDraftChange,
   onSubmitQuality,
-  gatewayDisconnected,
+  gatewayDisconnected: _gatewayDisconnected,
   onResetDraftSession,
+  onRequestStyleAnalysis,
 }: Props) {
   const navigate = useNavigate()
+  const { activeAccount, addCumulativeEditsToActiveAccount } = useActiveAccount()
   const [title, setTitle] = useState('')
   const [tags, setTags] = useState<string[]>([])
   const [tagInput, setTagInput] = useState('')
@@ -351,11 +401,43 @@ export default function XhsPostEditor({
     imageUrl: undefined,
   })
 
-  const [isOriginalityOpen, setIsOriginalityOpen] = useState(false)
-  const [isQualityOpen, setIsQualityOpen] = useState(false)
+  const [coverImageFile, setCoverImageFile] = useState<File | null>(null)
+  const [aiPanelOpen, setAiPanelOpen] = useState(false)
+  const [appliedSuggestionIds, setAppliedSuggestionIds] = useState<Record<string, boolean>>({})
+  const [showDeepQualityLink, setShowDeepQualityLink] = useState(false)
+  const coverCompositeObjectUrlRef = useRef<string | null>(null)
+  const idleQualityTimerRef = useRef<number | null>(null)
+  /** 基准草稿变更后用于重算 debounce 改写率 */
+  const [originalitySessionTick, setOriginalitySessionTick] = useState(0)
+  /** 1s debounce 后的改写率（0~1） */
+  const [debouncedRewriteRatio, setDebouncedRewriteRatio] = useState(0)
+
+  const persistedSessionEditCountRef = useRef(0)
+  const editHistoryLengthRef = useRef(0)
+  editHistoryLengthRef.current = editHistory.length
 
   const hasDraft = stage >= 2 && !!loadedDraft
   const editCount = editHistory.length
+
+  const historicalEditCount = activeAccount.cumulativeEditCount ?? 0
+  const totalEditCount = historicalEditCount + editCount
+  const progressToNext = totalEditCount % 10
+  const styleProgressDisplay = totalEditCount > 0 && progressToNext === 0 ? 10 : progressToNext
+  const styleBarWidthPct =
+    totalEditCount > 0 && progressToNext === 0 ? 100 : (progressToNext / 10) * 100
+  const styleAnalysisCount = activeAccount.styleAnalysisCount ?? 0
+  /** 下一轮可触发风格分析所需的累计编辑下限（10、20、30…） */
+  const nextStyleAnalysisAt = (styleAnalysisCount + 1) * 10
+  const showStyleAnalysisPrompt =
+    totalEditCount >= nextStyleAnalysisAt && typeof onRequestStyleAnalysis === 'function'
+
+  const flushSessionEditsToAccount = useCallback(() => {
+    const delta = editHistory.length - persistedSessionEditCountRef.current
+    if (delta > 0) {
+      addCumulativeEditsToActiveAccount(delta)
+      persistedSessionEditCountRef.current = editHistory.length
+    }
+  }, [editHistory.length, addCumulativeEditsToActiveAccount])
 
   // Boot / 选题：无 Skill 草稿时保持编辑器空白，避免占位文案污染。
   useEffect(() => {
@@ -373,6 +455,13 @@ export default function XhsPostEditor({
     setPostId(null)
     setEditHistory([])
     setSessionCreatedAt('')
+    persistedSessionEditCountRef.current = 0
+    setDebouncedRewriteRatio(0)
+    setCoverImageFile(null)
+    if (coverCompositeObjectUrlRef.current) {
+      URL.revokeObjectURL(coverCompositeObjectUrlRef.current)
+      coverCompositeObjectUrlRef.current = null
+    }
     originalDraftRef.current = null
     originalTitleRef.current = ''
     originalTagsRef.current = []
@@ -383,8 +472,6 @@ export default function XhsPostEditor({
       overlayText: '',
       imageUrl: undefined,
     }
-    setIsOriginalityOpen(false)
-    setIsQualityOpen(false)
   }, [stage, loadedDraft])
 
   // Load stage2 draft.
@@ -399,13 +486,19 @@ export default function XhsPostEditor({
     setTags(loadedDraft.tags)
     setTagInput('')
     setCover(loadedDraft.cover)
-    setParagraphs(splitIntoParagraphs(loadedDraft.body))
-    setOriginalParagraphs(splitIntoParagraphs(loadedDraft.body))
+    setParagraphs(splitBodyLines(loadedDraft.body))
+    setOriginalParagraphs(splitBodyLines(loadedDraft.body))
     const now = new Date().toISOString()
     const nextPostId = uidForPost()
     setPostId(nextPostId)
     setEditHistory([])
     setSessionCreatedAt(now)
+    persistedSessionEditCountRef.current = 0
+    setCoverImageFile(null)
+    if (coverCompositeObjectUrlRef.current) {
+      URL.revokeObjectURL(coverCompositeObjectUrlRef.current)
+      coverCompositeObjectUrlRef.current = null
+    }
 
     originalDraftRef.current = loadedDraft
     originalTitleRef.current = loadedDraft.title
@@ -422,15 +515,14 @@ export default function XhsPostEditor({
       createdAt: now,
       updatedAt: now,
     })
-    setIsOriginalityOpen(false)
-    setIsQualityOpen(false)
+    setOriginalitySessionTick((t) => t + 1)
   }, [stage, loadedDraft])
 
   // If stage >= 3 and original draft is passed, use it for diff marking.
   useEffect(() => {
     if (stage < 3) return
     if (!originalDraft) return
-    setOriginalParagraphs(splitIntoParagraphs(originalDraft.body))
+    setOriginalParagraphs(splitBodyLines(originalDraft.body))
   }, [stage, originalDraft])
 
   // Keep refs in sync for debounced persistence.
@@ -441,7 +533,7 @@ export default function XhsPostEditor({
   useEffect(() => {
     draftRef.current = {
       title,
-      body: paragraphs.join('\n\n'),
+      body: paragraphs.join('\n'),
       tags,
       cover,
     }
@@ -455,7 +547,7 @@ export default function XhsPostEditor({
     const t = window.setTimeout(() => {
       onDraftChange({
         title,
-        body: paragraphs.join('\n\n'),
+        body: paragraphs.join('\n'),
         tags,
         cover,
       })
@@ -464,62 +556,93 @@ export default function XhsPostEditor({
     return () => window.clearTimeout(t)
   }, [onDraftChange, stage, title, paragraphs, tags, cover])
 
-  // Quality panel default behavior at stage3.
+  // 原创度改写率：编辑后 1s debounce 再更新（基线来自 Skill 或默认 10%）
   useEffect(() => {
-    if (stage === 3) setIsQualityOpen(true)
-  }, [stage])
+    const orig = originalDraftRef.current
+    if (!orig) {
+      setDebouncedRewriteRatio(0)
+      return
+    }
+    const t = window.setTimeout(() => {
+      const current = { title, body: paragraphs.join('\n') }
+      setDebouncedRewriteRatio(calculateRewriteRatio(orig, current))
+    }, 1000)
+    return () => window.clearTimeout(t)
+  }, [title, paragraphs, originalitySessionTick])
+
+  // 用户上传照片后：Canvas 合成封面预览（大字变更时重算）
+  useEffect(() => {
+    if (!coverImageFile) return
+    let cancelled = false
+    void generateCoverPreview(coverImageFile, cover.overlayText).then((blob) => {
+      if (cancelled || !blob) return
+      if (coverCompositeObjectUrlRef.current) {
+        URL.revokeObjectURL(coverCompositeObjectUrlRef.current)
+      }
+      const url = URL.createObjectURL(blob)
+      coverCompositeObjectUrlRef.current = url
+      setCover((c) => ({ ...c, imageUrl: url, type: 'photo' }))
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [coverImageFile, cover.overlayText])
+
+  useEffect(() => {
+    if (qualityScore) {
+      setAiPanelOpen(true)
+    }
+  }, [qualityScore])
+
+  useEffect(() => {
+    if (stage !== 2 || !onSubmitQuality) {
+      setShowDeepQualityLink(false)
+      return
+    }
+    setShowDeepQualityLink(false)
+    if (idleQualityTimerRef.current) window.clearTimeout(idleQualityTimerRef.current)
+    idleQualityTimerRef.current = window.setTimeout(() => {
+      setShowDeepQualityLink(true)
+    }, 5000)
+    return () => {
+      if (idleQualityTimerRef.current) window.clearTimeout(idleQualityTimerRef.current)
+    }
+  }, [stage, title, paragraphs, cover.overlayText, cover.imageUrl, tags, onSubmitQuality])
+
+  useEffect(() => {
+    return () => {
+      const delta = editHistoryLengthRef.current - persistedSessionEditCountRef.current
+      if (delta > 0) {
+        addCumulativeEditsToActiveAccount(delta)
+        persistedSessionEditCountRef.current = editHistoryLengthRef.current
+      }
+    }
+  }, [addCumulativeEditsToActiveAccount])
 
   const originality = useMemo<OriginalityReport>(() => {
-    // Use gateway report as a seed, but still let user edits move the ring.
-    const modifiedCount = paragraphs.reduce((acc, p, idx) => {
-      const o = originalParagraphs[idx] ?? ''
-      return acc + (p.trim() !== o.trim() ? 1 : 0)
-    }, 0)
-
-    const seedUserMaterialPct = originalityReport
-      ? originalityReport.userMaterialPct
-      : clamp(70 - editCount * 3.2, 0, 100)
-
-    const userMaterialPct = clamp(seedUserMaterialPct - editCount * 3.2 - modifiedCount * 0.9, 0, 100)
-    const aiAssistPct = clamp(100 - userMaterialPct, 0, 100)
-    const compliance = complianceFromUserPct(userMaterialPct)
-
-    const sourcesSeed = originalityReport?.materialSources?.length ? originalityReport.materialSources : []
-    const sourcesSet = new Set<string>(sourcesSeed)
-    sourcesSet.add('用户直接输入')
-    if (editCount >= 2 || modifiedCount >= 3) sourcesSet.add('素材银行 #3')
-    else sourcesSet.add('素材银行 #1')
+    const baselineFromSkill = originalityReport?.userMaterialPct ?? 10
+    const displayedOriginality = clamp(
+      baselineFromSkill + debouncedRewriteRatio * 90,
+      0,
+      100,
+    )
+    const compliance = complianceFromOriginalityDisplay(displayedOriginality)
+    const aiAssistPct = clamp(100 - displayedOriginality, 0, 100)
+    const materialSources =
+      originalityReport?.materialSources?.length ? originalityReport.materialSources : ['用户直接输入']
 
     return {
-      userMaterialPct,
+      userMaterialPct: displayedOriginality,
       aiAssistPct,
       compliance,
-      materialSources: Array.from(sourcesSet),
+      materialSources,
     }
-  }, [originalityReport, editCount, paragraphs, originalParagraphs])
-
-  const computedQuality = useMemo<QualityScore>(() => {
-    if (qualityScore) return qualityScore
-    return computeQualityFromEditCount(editCount)
-  }, [qualityScore, editCount])
-
-  const qualityTotal = useMemo(() => {
-    const dims = [
-      computedQuality.hook,
-      computedQuality.authentic,
-      computedQuality.aiSmell,
-      computedQuality.diversity,
-      computedQuality.cta,
-      computedQuality.platform,
-    ]
-    return Math.round(dims.reduce((a, b) => a + b, 0) / dims.length)
-  }, [computedQuality])
+  }, [originalityReport, debouncedRewriteRatio])
 
   const modifiedParagraphs = useMemo(() => {
-    const orig = originalParagraphs
     return paragraphs.map((p, idx) => {
-      const o = orig[idx] ?? ''
-      return p.trim() !== o.trim()
+      const o = originalParagraphs[idx] ?? ''
+      return idx >= originalParagraphs.length || p !== o
     })
   }, [paragraphs, originalParagraphs])
 
@@ -579,7 +702,7 @@ export default function XhsPostEditor({
     pendingEditRef.current = null
 
     const now = new Date().toISOString()
-    const currentBody = paragraphs.join('\n\n')
+    const currentBody = paragraphs.join('\n')
     const record: EditRecord = {
       id: uidForPost(),
       postId,
@@ -615,8 +738,9 @@ export default function XhsPostEditor({
     return next
   }
 
-  function handleSaveToKB() {
+  async function handleSaveToKB() {
     if (stageRef.current < 2) return
+    flushSessionEditsToAccount()
     const original = originalDraftRef.current
     if (!original) return
 
@@ -624,26 +748,32 @@ export default function XhsPostEditor({
     const history = applyPendingEditNow()
 
     const id = postId ?? uidForPost()
+    const storedImageUrl = await persistableImageUrl(cover.imageUrl)
     const draft: Draft = {
       title,
-      body: paragraphs.join('\n\n'),
+      body: paragraphs.join('\n'),
       tags,
-      cover,
+      cover: { ...cover, imageUrl: storedImageUrl },
     }
 
-    const status = stageRef.current >= 4 ? 'finalized' : 'draft'
+    const status: KnowledgePost['status'] = stageRef.current >= 4 ? 'finalized' : 'draft'
 
-    setPendingPublish({
+    const post = {
       id,
       status,
-      draft,
+      title: draft.title,
+      body: draft.body,
+      tags: draft.tags,
+      cover: draft.cover,
       originalDraft: original,
       editHistory: history,
       createdAt: sessionCreatedAt || now,
       updatedAt: now,
-    })
+    }
 
-    navigate('/pending-publish')
+    savePost(post)
+    addStyleSampleFromPost(post)
+    navigate('/knowledge-base')
   }
 
   function recordEdit() {
@@ -680,7 +810,34 @@ export default function XhsPostEditor({
 
   function onChangeParagraph(idx: number, next: string) {
     if (stage >= 4) return
-    const nextParas = splitIntoParagraphsForBodyEdit(next)
+
+    // 本段被删空：去掉该段 DOM，避免留下带绿条/侧栏的空白块（至少保留一段可编辑）
+    if (!next.trim()) {
+      if (isComposingRef.current) {
+        setParagraphs((prev) => {
+          const copy = [...prev]
+          copy[idx] = next
+          return copy
+        })
+        return
+      }
+      setParagraphs((prev) => {
+        if (prev.length <= 1) return ['']
+        const copy = [...prev]
+        copy.splice(idx, 1)
+        return copy.length ? copy : ['']
+      })
+      setOriginalParagraphs((prev) => {
+        if (prev.length <= 1) return prev
+        const copy = [...prev]
+        copy.splice(idx, 1)
+        return copy.length ? copy : ['']
+      })
+      if (!isComposingRef.current) recordEdit()
+      return
+    }
+
+    const nextParas = splitBodyLinesInput(next)
     setParagraphs((prev) => {
       const copy = [...prev]
       copy.splice(idx, 1, ...nextParas)
@@ -689,53 +846,121 @@ export default function XhsPostEditor({
     if (!isComposingRef.current) recordEdit()
   }
 
+  function deleteParagraph(idx: number) {
+    if (stage >= 4) return
+    setParagraphs((prev) => {
+      const copy = [...prev]
+      copy.splice(idx, 1)
+      return copy.length ? copy : ['']
+    })
+    setOriginalParagraphs((prev) => {
+      const copy = [...prev]
+      copy.splice(idx, 1)
+      return copy.length ? copy : ['']
+    })
+    if (!isComposingRef.current) recordEdit()
+  }
+
+  function coverTypeLabel(t: CoverType): string {
+    const m: Record<CoverType, string> = {
+      photo: '实拍图',
+      text: '文字封面',
+      collage: '拼图',
+      compare: '对比图',
+      list: '清单图',
+    }
+    return m[t] ?? '推荐'
+  }
+
+  async function handleDownloadCover() {
+    if (!coverImageFile) return
+    const blob = await generateCoverPreview(coverImageFile, cover.overlayText)
+    if (!blob) return
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'ideashu-cover.jpg'
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
   function renderCoverSlot() {
-    const canUpload = stage < 4
-    const showImage = cover.imageUrl && cover.type !== 'text'
+    const canEdit = stage < 4
+    const hasUserPhoto = coverImageFile !== null
+    const skillCover = loadedDraft?.cover
+    const suggestType = skillCover?.type ?? cover.type
+    const suggestDesc = (skillCover?.description ?? cover.description ?? '').trim() || '（暂无画面描述）'
+    const overlayLen = (cover.overlayText || '').length
+    const overlayFontPx = Math.min(24, Math.max(14, 22 - Math.floor(overlayLen / 6)))
+
     return (
-      <div className="relative aspect-[3/4] w-full overflow-hidden rounded-xl border border-border-muted bg-[#f2f2f2]">
-        {!showImage ? (
-          <div className="absolute inset-0 bg-gradient-to-br from-[#fce4ec] via-[#fff3e0] to-[#e8f5e9]" />
-        ) : null}
-
-        {showImage ? (
-          <div className="absolute inset-0 flex items-center justify-center">
-            <img
-              src={cover.imageUrl}
-              alt="cover"
-              className="max-h-full max-w-full object-contain"
-            />
-          </div>
-        ) : (
-          <div className="absolute inset-0 flex items-center justify-center px-3 text-center text-[11px] font-semibold text-text-secondary/80">
-            {cover.type === 'photo' && '封面占位：实拍图'}
-            {cover.type === 'collage' && '封面占位：拼图'}
-            {cover.type === 'compare' && '封面占位：对比图'}
-            {cover.type === 'list' && '封面占位：清单图'}
-            {cover.type === 'text' && '封面占位：文字封面'}
-          </div>
-        )}
-
-        <div className="absolute left-2 right-2 top-[18%]">
-          <div className="rounded-lg bg-black/35 px-2 py-1.5 backdrop-blur">
-            <input
-              value={cover.overlayText}
-              onChange={(e) => {
-                if (stage >= 4) return
-                setCover((c) => ({ ...c, overlayText: e.target.value }))
-                recordEdit()
-              }}
-              readOnly={stage >= 4}
-              placeholder="封面大字"
-              className="w-full border-none bg-transparent text-center text-[14px] font-bold text-white outline-none placeholder:text-white/60 md:text-[15px]"
-            />
-          </div>
+      <div className="flex min-w-0 flex-col gap-2">
+        <div
+          className={`relative aspect-[3/4] w-full overflow-hidden rounded-xl border ${
+            hasUserPhoto ? 'border-border-muted bg-black/5' : 'border-dashed border-border-muted'
+          }`}
+        >
+          {!hasUserPhoto ? (
+            <>
+              <div
+                className="absolute inset-0 bg-gradient-to-br from-[#fce4ec] via-[#fff3e0] to-[#e8f5e9]"
+                aria-hidden
+              />
+              <div className="relative z-10 flex h-full min-h-[200px] flex-col justify-between p-3">
+                <div className="space-y-2">
+                  <div className="inline-flex rounded-full border border-white/60 bg-white/70 px-2.5 py-1 text-[11px] font-bold text-primary shadow-sm backdrop-blur-sm">
+                    推荐类型 · {coverTypeLabel(suggestType)}
+                  </div>
+                  <p className="rounded-lg border border-white/50 bg-white/65 px-2.5 py-2 text-[12px] leading-snug text-text-main shadow-sm backdrop-blur-sm">
+                    {suggestDesc}
+                  </p>
+                  <div className="rounded-lg border border-white/60 bg-white/75 px-2 py-2.5 text-center shadow-sm backdrop-blur-sm">
+                    <div className="text-[10px] font-semibold text-text-secondary">
+                      封面大字（来自 Skill，可上传后叠加）
+                    </div>
+                    <div
+                      className="mt-1 font-bold text-text-main"
+                      style={{ fontSize: `${Math.min(20, Math.max(14, 18 - overlayLen / 8))}px` }}
+                    >
+                      {cover.overlayText || '—'}
+                    </div>
+                  </div>
+                </div>
+                <div className="rounded-lg border border-white/55 bg-white/60 py-2 text-center text-[11px] font-semibold text-text-main shadow-sm backdrop-blur-sm">
+                  上传你拍的照片作为封面
+                </div>
+              </div>
+            </>
+          ) : (
+            <>
+              <img
+                src={cover.imageUrl}
+                alt="封面预览"
+                className="h-full w-full object-cover"
+              />
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[38%] bg-gradient-to-t from-black/60 to-transparent" />
+              <div className="absolute inset-x-0 bottom-0 p-3">
+                <input
+                  value={cover.overlayText}
+                  onChange={(e) => {
+                    if (!canEdit) return
+                    setCover((c) => ({ ...c, overlayText: e.target.value }))
+                    recordEdit()
+                  }}
+                  readOnly={!canEdit}
+                  placeholder="封面大字"
+                  className="pointer-events-auto w-full border-none bg-transparent text-center font-bold text-white outline-none placeholder:text-white/50"
+                  style={{ fontSize: `${overlayFontPx}px` }}
+                />
+              </div>
+            </>
+          )}
         </div>
 
-        {canUpload && (
-          <>
-            <label className="absolute bottom-3 left-3 cursor-pointer rounded-lg border border-border-muted bg-white/95 px-2 py-1 text-[10px] font-semibold shadow-sm transition-colors hover:bg-white">
-              上传图片
+        {canEdit ? (
+          <div className="flex flex-wrap gap-2">
+            <label className="cursor-pointer rounded-lg border border-border-muted bg-surface px-3 py-1.5 text-[11px] font-semibold text-text-main transition-colors hover:border-primary/40 hover:text-primary">
+              {hasUserPhoto ? '更换照片' : '上传照片'}
               <input
                 type="file"
                 accept="image/*"
@@ -743,18 +968,21 @@ export default function XhsPostEditor({
                 onChange={(e) => {
                   const file = e.target.files?.[0]
                   if (!file) return
-                  const reader = new FileReader()
-                  reader.onload = () => {
-                    const result = String(reader.result ?? '')
-                    setCover((c) => ({ ...c, imageUrl: result }))
-                    recordEdit()
-                  }
-                  reader.readAsDataURL(file)
+                  setCoverImageFile(file)
+                  recordEdit()
                 }}
               />
             </label>
-          </>
-        )}
+            <button
+              type="button"
+              disabled={!hasUserPhoto}
+              onClick={() => void handleDownloadCover()}
+              className="rounded-lg border border-border-muted bg-surface px-3 py-1.5 text-[11px] font-semibold text-text-main transition-colors hover:border-primary/40 hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              下载封面
+            </button>
+          </div>
+        ) : null}
       </div>
     )
   }
@@ -767,11 +995,37 @@ export default function XhsPostEditor({
       ? [loadedDraft.mode, loadedDraft.structureType].filter(Boolean).join(' · ')
       : ''
 
-  const originalityBadge = complianceColor(originality.compliance)
+  const draftBodyPreview = paragraphs.join('\n')
 
-  const coverTypeOptions = COVER_OPTIONS
+  const aiSuggestionItems = useMemo(() => {
+    const sug = qualityScore?.suggestions ?? []
+    const n = Math.max(paragraphs.length, 1)
+    return sug.map((text, i) => ({
+      id: `ai-sug-${i}`,
+      paragraphIndex: i % n,
+      text,
+      applied: !!appliedSuggestionIds[`ai-sug-${i}`],
+    }))
+  }, [qualityScore, paragraphs.length, appliedSuggestionIds])
 
-  const draftBodyPreview = paragraphs.join('\n\n')
+  function applyAiSuggestion(id: string, paragraphIndex: number, text: string) {
+    if (stage >= 4) return
+    setParagraphs((prev) => {
+      const next = [...prev]
+      if (paragraphIndex >= 0 && paragraphIndex < next.length) {
+        next[paragraphIndex] = text
+      }
+      return next
+    })
+    setAppliedSuggestionIds((prev) => ({ ...prev, [id]: true }))
+    recordEdit()
+  }
+
+  function originalityBarColor(pct: number) {
+    if (pct >= 60) return '#22c55e'
+    if (pct >= 40) return '#eab308'
+    return '#ef4444'
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col font-sans">
@@ -798,45 +1052,17 @@ export default function XhsPostEditor({
               重置草稿
             </button>
           ) : null}
-          <div className="hidden">
-            <OriginalityRing userMaterialPct={originality.userMaterialPct} compliance={originality.compliance} />
-          </div>
         </div>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto bg-canvas p-2">
         <div className="overflow-hidden rounded-xl border border-border-muted bg-surface">
           <div className="grid grid-cols-1 gap-4 p-3 md:grid-cols-[minmax(200px,42%)_minmax(0,1fr)] md:items-start md:gap-5 md:p-4">
-            {/* 左：封面类型 + 封面（3:4 完整显示图片） */}
-            <div className="flex min-w-0 flex-col gap-2 md:max-w-full">
-              <div className="flex flex-wrap items-center gap-1.5">
-                {coverTypeOptions.map((opt) => {
-                  const active = cover.type === opt.type
-                  return (
-                    <button
-                      key={opt.type}
-                      type="button"
-                      onClick={() => {
-                        if (isReadOnly) return
-                        setCover((c) => ({ ...c, type: opt.type }))
-                        recordEdit()
-                      }}
-                      className={
-                        active
-                          ? 'rounded-full border border-primary/35 bg-primary/10 px-2.5 py-1 text-[11px] font-semibold text-primary'
-                          : 'rounded-full border border-border-muted px-2.5 py-1 text-[11px] font-semibold text-text-secondary transition-colors hover:border-primary/30 hover:bg-canvas'
-                      }
-                    >
-                      {opt.label}
-                    </button>
-                  )
-                })}
-              </div>
-              {renderCoverSlot()}
-            </div>
+            {/* 左：封面预览 */}
+            <div className="flex min-w-0 flex-col gap-2 md:max-w-full">{renderCoverSlot()}</div>
 
-            {/* 右：标题 / 正文 / 标签 / 报告 */}
-            <div className="flex min-h-0 min-w-0 flex-col gap-3">
+            {/* 右：标题 / 正文 / 标签 + AI 建议 */}
+            <div className="relative flex min-h-0 min-w-0 flex-col gap-3">
           {/* Title */}
           <div className="space-y-1">
             <div className="flex items-center justify-between gap-2">
@@ -856,36 +1082,32 @@ export default function XhsPostEditor({
             />
           </div>
 
-          {/* Body */}
-          <div className="space-y-1.5">
+          {/* Body：按段竖线标记 AI / 用户改写 */}
+          <div className="space-y-1">
             <div className="text-[11px] font-semibold text-text-secondary">正文</div>
-            <div className="space-y-2">
-              {paragraphs.map((p, idx) => {
-                const modified = modifiedParagraphs[idx] ?? false
-                return (
-                  <AutoGrowParagraph
-                    key={idx}
-                    value={p}
-                    readOnly={isReadOnly}
-                    modified={modified}
-                    onChange={(next) => onChangeParagraph(idx, next)}
-                    onCompositionStart={() => {
-                      isComposingRef.current = true
-                      if (editDebounceTimer.current) {
-                        window.clearTimeout(editDebounceTimer.current)
-                        editDebounceTimer.current = null
-                      }
-                      pendingEditRef.current = null
-                    }}
-                    onCompositionEnd={() => {
-                      if (isReadOnly) return
-                      isComposingRef.current = false
-                      recordEdit()
-                    }}
-                  />
-                )
-              })}
-            </div>
+            <BodyParagraphsWithSideSwipe
+              paragraphs={paragraphs}
+              readOnly={isReadOnly}
+              modifiedParagraphs={modifiedParagraphs}
+              onChangeParagraph={onChangeParagraph}
+              onDeleteParagraph={(idx) => {
+                if (isReadOnly) return
+                deleteParagraph(idx)
+              }}
+              onCompositionStart={() => {
+                isComposingRef.current = true
+                if (editDebounceTimer.current) {
+                  window.clearTimeout(editDebounceTimer.current)
+                  editDebounceTimer.current = null
+                }
+                pendingEditRef.current = null
+              }}
+              onCompositionEnd={() => {
+                if (isReadOnly) return
+                isComposingRef.current = false
+                recordEdit()
+              }}
+            />
           </div>
 
           {/* Tags */}
@@ -938,108 +1160,61 @@ export default function XhsPostEditor({
             </div>
           ) : null}
 
-          {/* Originality panel */}
-          <div className="mt-1 space-y-2">
-            <div className="flex items-center justify-between gap-2">
-              <div className="text-[11px] font-semibold text-text-secondary">原创度</div>
-              <OriginalityRing
-                userMaterialPct={originality.userMaterialPct}
-                compliance={originality.compliance}
-                size={36}
-                onClick={() => {
-                  if (stage < 2) return
-                  setIsOriginalityOpen((v) => !v)
-                }}
-              />
-            </div>
-
-            {isOriginalityOpen && stage >= 2 && (
-              <div className={`rounded-lg border p-3 ${originalityBadge.badge}`}>
-                <div className="flex items-start justify-between gap-3">
-                  <div className="space-y-1">
-                    <div className="text-sm font-bold text-text-main">
-                      合规评估:{' '}
-                      {originality.compliance === 'safe'
-                        ? '✅ 安全'
-                        : originality.compliance === 'caution'
-                          ? '⚠️ 建议补充素材'
-                          : '🚫 风险较高'}
-                    </div>
-                    <div className="text-xs text-text-secondary">
-                      用户素材占比: {formatPct(originality.userMaterialPct)} / AI 辅助占比:{' '}
-                      {formatPct(originality.aiAssistPct)}
-                    </div>
-                  </div>
-                  <div className="text-xs font-bold text-text-secondary whitespace-nowrap">
-                    {originality.compliance.toUpperCase()}
-                  </div>
-                </div>
-                <div className="mt-3">
-                  <div className="text-xs font-bold text-text-secondary mb-2">素材来源列表</div>
-                  <div className="flex flex-wrap gap-2">
-                    {originality.materialSources.map((s) => (
-                      <span
-                        key={s}
-                        className="px-2 py-1 rounded-full border border-border-muted text-[11px] font-bold text-text-secondary bg-white/60"
-                      >
-                        {s}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Quality score panel */}
-          {stage >= 3 && (
-            <div className="mt-1 space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <div className="text-[11px] font-semibold text-text-secondary">质量评分</div>
+          {/* AI 建议（右上可折叠） */}
+          {hasDraft ? (
+            <div className="pointer-events-none absolute right-0 top-0 z-10 flex max-w-full flex-col items-end gap-1 pr-0">
+              <div className="pointer-events-auto flex flex-col items-end gap-1">
                 <button
                   type="button"
-                  onClick={() => setIsQualityOpen((v) => !v)}
-                  className="rounded-md border border-border-muted px-2 py-1 text-[11px] font-medium text-text-secondary transition-colors hover:border-primary/40 hover:text-primary"
+                  onClick={() => setAiPanelOpen((v) => !v)}
+                  className="relative flex h-8 w-8 items-center justify-center rounded-full border border-border-muted bg-surface text-[15px] shadow-sm transition-colors hover:border-primary/40"
+                  title="AI 建议"
                 >
-                  {isQualityOpen ? '收起' : '展开'}
+                  💡
+                  {aiSuggestionItems.length > 0 ? (
+                    <span className="absolute -right-1 -top-1 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-white">
+                      {aiSuggestionItems.length}
+                    </span>
+                  ) : null}
                 </button>
+                {aiPanelOpen ? (
+                  <div className="w-[min(100%,18rem)] rounded-xl border border-border-muted bg-surface p-3 shadow-lg">
+                    <div className="mb-2 text-[11px] font-bold text-text-main">AI 建议</div>
+                    {stage < 3 || aiSuggestionItems.length === 0 ? (
+                      <p className="text-[11px] leading-snug text-text-secondary">
+                        编辑完成后点击「深度质检」获取 AI 修改建议（阶段二暂无质检数据）。
+                      </p>
+                    ) : (
+                      <ul className="max-h-[240px] space-y-2 overflow-y-auto pr-0.5">
+                        {aiSuggestionItems.map((item) => (
+                          <li
+                            key={item.id}
+                            className={`rounded-lg border border-border-muted p-2 text-[11px] ${
+                              item.applied ? 'bg-canvas/50 opacity-60 line-through' : 'bg-canvas/30'
+                            }`}
+                          >
+                            <div className="font-semibold text-text-secondary">第 {item.paragraphIndex + 1} 段</div>
+                            <p className="mt-1 text-text-main">{item.text}</p>
+                            {!item.applied ? (
+                              <button
+                                type="button"
+                                onClick={() => applyAiSuggestion(item.id, item.paragraphIndex, item.text)}
+                                className="mt-2 rounded-md bg-primary px-2 py-1 text-[10px] font-semibold text-white hover:bg-primary/90"
+                              >
+                                采纳
+                              </button>
+                            ) : (
+                              <span className="mt-1 inline-block text-[10px] text-text-tertiary">已采纳</span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                ) : null}
               </div>
-              {isQualityOpen && (
-                <div className="rounded-lg border border-border-muted bg-canvas/40 p-3">
-                  <div className="flex items-baseline justify-between gap-3">
-                    <div className="space-y-0">
-                      <div className="text-[10px] font-medium text-text-secondary">综合分</div>
-                      <div
-                        className="text-2xl font-bold tabular-nums leading-none"
-                        style={{ color: barFillColor(qualityTotal) }}
-                      >
-                        {qualityTotal}
-                      </div>
-                    </div>
-                    <div className="text-right text-[10px] text-text-tertiary">6 维 · 示例</div>
-                  </div>
-
-                  <div className="mt-3 flex flex-col gap-1.5">
-                    <Bar label="Hook" value={computedQuality.hook} />
-                    <Bar label="Authentic" value={computedQuality.authentic} />
-                    <Bar label="AI Smell" value={computedQuality.aiSmell} />
-                    <Bar label="Diversity" value={computedQuality.diversity} />
-                    <Bar label="CTA" value={computedQuality.cta} />
-                    <Bar label="Platform" value={computedQuality.platform} />
-                  </div>
-
-                  <div className="mt-3">
-                    <div className="mb-1 text-[10px] font-semibold text-text-secondary">建议</div>
-                    <ul className="list-disc space-y-0.5 pl-4 text-[12px] leading-snug text-text-secondary">
-                      {computedQuality.suggestions.map((s, idx) => (
-                        <li key={`${s}-${idx}`}>{s}</li>
-                      ))}
-                    </ul>
-                  </div>
-                </div>
-              )}
             </div>
-          )}
+          ) : null}
 
           {/* Stage4 finalize */}
           {stage >= 4 && (
@@ -1069,7 +1244,7 @@ export default function XhsPostEditor({
                 </button>
                 <button
                   type="button"
-                  onClick={handleSaveToKB}
+                  onClick={() => void handleSaveToKB()}
                   className="rounded-lg bg-text-main px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-text-main/90"
                 >
                 保存
@@ -1082,62 +1257,99 @@ export default function XhsPostEditor({
         </div>
       </div>
 
-      {/* Bottom toolbar (fixed inside editor) */}
-      <div className="shrink-0 border-t border-border-muted bg-surface px-3 py-2">
-        <div className="flex items-center justify-between gap-2 md:gap-3">
-          <div className="flex min-w-0 flex-col gap-1">
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-0 text-[10px] font-medium text-text-secondary">
-              <span>字数 {wordCount}</span>
-              <span>编辑 {editCount}</span>
+      {/* Bottom toolbar：三栏 — 字数 / 原创度 / 风格学习 + 保存 */}
+      <div className="shrink-0 border-t border-border-muted bg-surface px-2 py-2 md:px-3">
+        <div className="grid grid-cols-1 items-center gap-2 md:grid-cols-3 md:gap-3">
+          <div className="min-w-0 text-center md:text-left">
+            <div className="text-[11px] font-semibold text-text-secondary">字数</div>
+            <div className="text-lg font-black tabular-nums text-text-main">{wordCount}</div>
+          </div>
+
+          <div className="min-w-0 flex flex-col items-stretch gap-1 px-1">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10px] font-semibold text-text-secondary">原创度</span>
+              <span
+                className="text-[11px] font-black tabular-nums"
+                style={{ color: originalityBarColor(originality.userMaterialPct) }}
+              >
+                {Math.round(originality.userMaterialPct)}%
+              </span>
             </div>
-            <div className="space-y-0.5">
+            <div className="h-2 overflow-hidden rounded-full bg-[#f0f0f0]">
+              <div
+                className="h-full rounded-full transition-[width] duration-500"
+                style={{
+                  width: `${clamp(originality.userMaterialPct, 0, 100)}%`,
+                  backgroundColor: originalityBarColor(originality.userMaterialPct),
+                }}
+              />
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10px] text-text-tertiary">
+                {originality.compliance === 'safe'
+                  ? '✅ 合规'
+                  : originality.compliance === 'caution'
+                    ? '⚠️ 注意'
+                    : '❌ 风险'}
+              </span>
+              {stage === 2 && onSubmitQuality && showDeepQualityLink ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowDeepQualityLink(false)
+                    onSubmitQuality()
+                  }}
+                  className="text-[10px] font-semibold text-primary underline-offset-2 hover:underline"
+                >
+                  深度质检
+                </button>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="flex min-w-0 flex-col items-stretch gap-1 md:items-end">
+            <div className="w-full md:max-w-[200px] md:self-end">
               <div className="flex items-center justify-between text-[10px] font-medium text-text-secondary">
-                <span>风格学习 {Math.min(editCount, 10)}/10</span>
-                {editCount >= 10 && <span className="text-success">可分析</span>}
+                <span>
+                  风格 {styleProgressDisplay}/10
+                  {totalEditCount > 0 && progressToNext === 0 ? (
+                    <span className="ml-1 text-emerald-600">已满档</span>
+                  ) : null}
+                </span>
               </div>
-              <div className="h-[3px] overflow-hidden rounded-sm bg-[#F0F0F0]">
+              <div className="mt-0.5 h-[3px] overflow-hidden rounded-sm bg-[#F0F0F0]">
                 <div
-                  className="h-full rounded-sm"
+                  className="h-full rounded-sm transition-[width] duration-300"
                   style={{
-                    width: `${(clamp(editCount, 0, 10) / 10) * 100}%`,
-                    backgroundColor: editCount >= 10 ? '#22c55e' : 'rgba(255, 36, 66, 0.2)',
+                    width: `${styleBarWidthPct}%`,
+                    backgroundColor:
+                      totalEditCount > 0 && progressToNext === 0 ? '#22c55e' : 'rgba(255, 36, 66, 0.2)',
                   }}
                 />
               </div>
             </div>
-          </div>
-
-          <div className="flex shrink-0 items-center justify-center">
-            <OriginalityRing
-              userMaterialPct={originality.userMaterialPct}
-              compliance={originality.compliance}
-              size={36}
-              onClick={() => setIsOriginalityOpen((v) => !v)}
-            />
-          </div>
-
-          <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
-            {stage === 2 && onSubmitQuality ? (
+            {showStyleAnalysisPrompt ? (
               <button
                 type="button"
-                onClick={onSubmitQuality}
-                disabled={!!gatewayDisconnected}
-                className="rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-primary/90 disabled:opacity-50"
+                onClick={() => onRequestStyleAnalysis?.()}
+                className="mt-1 self-end rounded border border-primary/30 bg-primary/5 px-2 py-0.5 text-[10px] font-semibold text-primary hover:bg-primary/10"
               >
-                提交质检
+                看我的修改规律
               </button>
             ) : null}
-            {stage < 4 ? (
-              <button
-                type="button"
-                onClick={handleSaveToKB}
-                className="rounded-lg bg-text-main px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-text-main/90"
-              >
-                保存到作品集
-              </button>
-            ) : (
-              <div className="text-[10px] font-medium text-text-secondary">定稿</div>
-            )}
+            <div className="mt-1 flex justify-end gap-1.5">
+              {stage < 4 ? (
+                <button
+                  type="button"
+                  onClick={() => void handleSaveToKB()}
+                  className="rounded-lg bg-text-main px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-text-main/90"
+                >
+                  保存到作品集
+                </button>
+              ) : (
+                <span className="text-[10px] text-text-secondary">已定稿</span>
+              )}
+            </div>
           </div>
         </div>
       </div>

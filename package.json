@@ -12,6 +12,8 @@
   "dependencies": {
     "@tailwindcss/vite": "^4.2.2",
     "autoprefixer": "^10.4.27",
+    "fabric": "^5.5.2",
+    "fabric-history": "^2.0.0",
     "marked": "^17.0.5",
     "postcss": "^8.5.8",
     "react": "^19.2.4",
@@ -21,6 +23,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
+    "@types/fabric": "^5.3.11",
     "@types/node": "^24.12.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",

@@ -7,16 +7,18 @@ import HotBoardPage from '../pages/HotBoardPage'
 import AccountsPage from '../pages/AccountsPage'
 import StyleLearningPage from '../pages/StyleLearningPage'
 import KnowledgeBasePage from '../pages/KnowledgeBasePage'
-import PendingPublishConfirmPage from '../pages/PendingPublishConfirmPage'
 import SettingsPage from '../pages/SettingsPage'
 import DataTrackingPage from '../pages/DataTrackingPage'
+import HotFetchPage from '../pages/HotFetchPage'
 
 export default function AppRouter() {
   return (
     <BrowserRouter>
       <Routes>
         <Route element={<Phase1Layout />}>
-          <Route path="/" element={<WorkspacePage />} />
+          <Route path="/" element={<Navigate to="/workspace" replace />} />
+          <Route path="/workspace" element={<WorkspacePage />} />
+          <Route path="/hot-fetch" element={<HotFetchPage />} />
           <Route path="/material-bank" element={<MaterialBankPage />} />
           <Route path="/knowledge-base" element={<KnowledgeBasePage />} />
         </Route>
@@ -25,12 +27,11 @@ export default function AppRouter() {
           <Route path="/hot-board" element={<HotBoardPage />} />
           <Route path="/accounts" element={<AccountsPage />} />
           <Route path="/style-learning" element={<StyleLearningPage />} />
-          <Route path="/pending-publish" element={<PendingPublishConfirmPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/data-tracking" element={<DataTrackingPage />} />
         </Route>
 
-        <Route path="*" element={<Navigate to="/" replace />} />
+        <Route path="*" element={<Navigate to="/workspace" replace />} />
       </Routes>
     </BrowserRouter>
   )

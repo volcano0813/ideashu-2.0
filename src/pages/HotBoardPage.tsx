@@ -221,7 +221,7 @@ export default function HotBoardPage() {
                         type="button"
                         onClick={() => {
                           setPendingDraft(draftFromSignal(sig))
-                          navigate('/')
+                          navigate('/workspace')
                         }}
                         className="px-4 py-2 rounded-lg bg-primary text-white font-semibold text-sm hover:bg-primary/90 transition-colors"
                       >

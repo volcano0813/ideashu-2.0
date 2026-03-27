@@ -1,4 +1,5 @@
 import type { Draft, EditorStage } from '../components/XhsPostEditor'
+import { MOCK_ACCOUNTS, normalizeAccountFields, type Account } from './accounts'
 
 export type MaterialType = 'text' | 'photo' | 'voice' | 'data'
 
@@ -9,6 +10,8 @@ export type Material = {
   /** 图片类素材：压缩后的 JPEG data URL，存于 localStorage */
   imageDataUrl?: string
   topicTags: string[]
+  /** 用于灵感库演示配色：琥珀/天蓝/玫瑰/薄荷/紫丁香/金黄（按索引 0-5） */
+  tintIndex?: number
   createdAt: string // YYYY-MM-DD
   usedInPosts: string[]
 }
@@ -71,6 +74,7 @@ const DRAFT_SESSION_KEY = 'ideashu.draftSession.v1'
 const PENDING_DRAFT_KEY = 'ideashu.pendingDraft.v1'
 const STYLE_SAMPLES_KEY = 'ideashu.styleSamples.v1'
 const PENDING_PUBLISH_KEY = 'ideashu.pendingPublish.v1'
+const ACCOUNTS_KEY = 'ideashu.accounts.v1'
 
 function safeParseJSON<T>(raw: string | null): T | null {
   if (!raw) return null
@@ -101,49 +105,55 @@ const DEFAULT_MATERIALS: Material[] = [
   {
     id: 'mat_1',
     type: 'text',
-    content: '我在吧台旁边等咖啡的 7 分钟，听见磨豆机的声音，然后突然想起“香气会让人慢下来”。',
-    topicTags: ['咖啡探店', '氛围', '慢生活'],
-    createdAt: '2026-03-20',
+    content: `下午3点的光是最好的。从落地窗斜进来，刚好打在吧台的原木台面上，手冲壶的不锈钢反射出一小片光斑在天花板上晃。店主说他当初选这个铺面就是因为这扇窗——朝西南，下午的光能从2点一直晒到5点半。`,
+    topicTags: ['光影', '白天', '吧台'],
+    tintIndex: 0,
+    createdAt: '2026-03-26',
     usedInPosts: [],
   },
   {
     id: 'mat_2',
-    type: 'photo',
-    content: '手冲台特写：木纹+暖光，杯壁形成细腻的泡沫纹理，颜色像在呼吸。',
-    topicTags: ['手冲', '暖光', '细节'],
-    createdAt: '2026-03-18',
+    type: 'text',
+    content: `7点是最有意思的时刻。店主开始收咖啡器具，她开始从吧台下面拿出酒瓶。灯从白光慢慢调成暖黄，墙上那排搁板的射灯亮起来，酒瓶的颜色一下子就出来了——琥珀色、翠绿色、透明的。上一秒还是咖啡馆，10分钟后完全变了。最后走的那个写代码的男生抬头看了一眼，说'我以为换了一家店'。`,
+    topicTags: ['切换', '夜晚', '反差'],
+    tintIndex: 1,
+    createdAt: '2026-03-25',
     usedInPosts: [],
   },
   {
     id: 'mat_3',
-    type: 'voice',
-    content: '店员说“今天豆子很香”，我顺手录下了那句，然后把语气和停顿一起写进笔记。',
-    topicTags: ['豆子', '店员', '原生表达'],
-    createdAt: '2026-03-16',
+    type: 'text',
+    content: `今天试了他们新上的「深圳迟早」——名字来自'深圳迟早会下雨'这个梗。用的是云南的日晒豆，中浅烘，手冲出来有很明显的莓果酸，但尾韵是巧克力味的，很暖。38块，量不大但值这个味道。店主说这个豆子只做了5公斤，卖完就没了。`,
+    topicTags: ['咖啡', '手冲', '限定'],
+    tintIndex: 2,
+    createdAt: '2026-03-24',
     usedInPosts: [],
   },
   {
     id: 'mat_4',
-    type: 'data',
-    content: '同价位对比记录：从豆子来源到出品稳定性，我总结了 3 个“可复来”的指标。',
-    topicTags: ['竞品', '价格', '复购'],
-    createdAt: '2026-03-14',
+    type: 'text',
+    content: `她调酒的时候不看配方，说是'凭手感'。今天给我调了一杯没有名字的——金酒打底，加了茉莉花糖浆和一点青柠，上面飘了一片薄荷叶。入口是花香，然后是酒的劲，最后嘴里留下青柠的凉。她说这杯叫'还没想好'。58块。`,
+    topicTags: ['调酒', '夜晚', '人物'],
+    tintIndex: 3,
+    createdAt: '2026-03-23',
     usedInPosts: [],
   },
   {
     id: 'mat_5',
     type: 'text',
-    content: '甜品搭配：酸度更柔和，甜而不腻；我把“入口第一秒的变化”写成一句钩子。',
-    topicTags: ['甜品', '搭配', '口感'],
-    createdAt: '2026-03-12',
+    content: `拍了两张同一个角度的照片。一张是下午4点，阳光打在木桌上，桌上放着一杯手冲和一本摊开的书。另一张是晚上9点，同一张桌子，灯光暗了，桌上变成一杯冒着烟雾的鸡尾酒和一个手机架（在放歌）。发给朋友看，她说'这真的是同一个地方？'`,
+    topicTags: ['反差', '白天vs夜晚', '视觉'],
+    tintIndex: 4,
+    createdAt: '2026-03-22',
     usedInPosts: [],
   },
   {
     id: 'mat_6',
-    type: 'photo',
-    content: '菜单边角和桌面反光：光线从柜台侧面斜进来，拍出来会有一点“电影感”。',
-    topicTags: ['光影', '桌面', '画面感'],
-    createdAt: '2026-03-10',
+    type: 'text',
+    content: `和店主聊了一会。他之前在互联网公司做产品经理，她在4A广告公司做创意。两个人都30岁那年辞职了。他说'做咖啡是因为想要一个每天能看到阳光的工作'，她说'调酒是因为晚上的人更容易说真话'。他们没有合伙人，装修是自己设计的，菜单是自己写的，连门口的手写黑板都是她的字。`,
+    topicTags: ['人物', '店主', '故事'],
+    tintIndex: 5,
+    createdAt: '2026-03-21',
     usedInPosts: [],
   },
 ]
@@ -168,6 +178,23 @@ export function addMaterial(input: Omit<Material, 'id' | 'createdAt' | 'usedInPo
   return mat
 }
 
+export function updateMaterial(
+  id: string,
+  patch: Partial<Omit<Material, 'id' | 'createdAt' | 'usedInPosts'>>,
+) {
+  const materials = loadMaterials()
+  const idx = materials.findIndex((m) => m.id === id)
+  if (idx < 0) return
+  const cur = materials[idx]
+  const merged: Material = { ...cur, ...patch }
+  if (merged.type === 'text') {
+    delete merged.imageDataUrl
+  }
+  const next = [...materials]
+  next[idx] = merged
+  localStorage.setItem(MATERIALS_KEY, JSON.stringify(next))
+}
+
 export function deleteMaterial(id: string) {
   const materials = loadMaterials()
   const next = materials.filter((m) => m.id !== id)
@@ -186,6 +213,12 @@ export function savePost(post: KnowledgePost) {
   const next = [...posts]
   if (idx >= 0) next[idx] = post
   else next.unshift(post)
+  localStorage.setItem(POSTS_KEY, JSON.stringify(next))
+}
+
+export function deletePost(id: string) {
+  const posts = loadPosts()
+  const next = posts.filter((p) => p.id !== id)
   localStorage.setItem(POSTS_KEY, JSON.stringify(next))
 }
 
@@ -257,5 +290,30 @@ export function consumePendingPublish(): PendingPublish | null {
 
 export function uidForPost() {
   return uid('post')
+}
+
+export function loadAccounts(): Account[] {
+  const parsed = safeParseJSON<Account[]>(localStorage.getItem(ACCOUNTS_KEY))
+  if (parsed && Array.isArray(parsed) && parsed.length > 0) {
+    const mapped = parsed.map((a) => normalizeAccountFields(a))
+    const dirty = mapped.some((a, i) => parsed[i]?.name !== a.name)
+    if (dirty) saveAccounts(mapped)
+    return mapped
+  }
+  const seed = [...MOCK_ACCOUNTS].map((a) => normalizeAccountFields(a))
+  try {
+    localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(seed))
+  } catch {
+    // ignore
+  }
+  return seed
+}
+
+export function saveAccounts(accounts: Account[]) {
+  try {
+    localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts))
+  } catch {
+    // ignore quota / private mode
+  }
 }
 

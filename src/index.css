@@ -139,3 +139,37 @@ code {
   padding: 4px 8px;
   background: var(--code-bg);
 }
+
+/* 作品集卡片：正文区滚动条默认隐藏，悬停卡片或正文区时显示低透明度细条 */
+.portfolio-card-scroll {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.portfolio-card-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+.group:hover .portfolio-card-scroll,
+.portfolio-card-scroll:hover {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.14) transparent;
+}
+.group:hover .portfolio-card-scroll::-webkit-scrollbar,
+.portfolio-card-scroll:hover::-webkit-scrollbar {
+  width: 5px;
+}
+.group:hover .portfolio-card-scroll::-webkit-scrollbar-thumb,
+.portfolio-card-scroll:hover::-webkit-scrollbar-thumb {
+  background-color: rgba(0, 0, 0, 0.16);
+  border-radius: 999px;
+}
+@media (prefers-color-scheme: dark) {
+  .group:hover .portfolio-card-scroll,
+  .portfolio-card-scroll:hover {
+    scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+  }
+  .group:hover .portfolio-card-scroll::-webkit-scrollbar-thumb,
+  .portfolio-card-scroll:hover::-webkit-scrollbar-thumb {
+    background-color: rgba(255, 255, 255, 0.14);
+  }
+}

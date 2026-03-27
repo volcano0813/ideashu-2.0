@@ -1,15 +1,8 @@
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import type { Draft } from '../components/XhsPostEditor'
 import { fileToCompressedDataUrl } from '../lib/imageCompress'
-import { useActiveAccount } from '../contexts/ActiveAccountContext'
-import {
-  addMaterial,
-  deleteMaterial,
-  loadMaterials,
-  setPendingDraft,
-  type Material,
-} from '../lib/ideashuStorage'
+import { addMaterial, deleteMaterial, loadMaterials, updateMaterial, type Material } from '../lib/ideashuStorage'
+import type { WorkspaceLocationState } from '../lib/workspaceLocationState'
 
 function formatMaterialDate(createdAt: string): string {
   const parts = createdAt.split('-').map(Number)
@@ -27,8 +20,15 @@ const cardTints = [
   { bg: '#FFFBF0', accent: '#D4B85C' },
 ]
 
-const CARD_R = '#FF2442'
-const CARD_R10 = 'rgba(255,36,66,0.06)'
+/** Soft fill from accent hex, matches tag + CTA treatment per card tint */
+function accentSoftFill(hex: string, alpha = 0.14) {
+  const s = hex.replace('#', '')
+  if (s.length !== 6) return `rgba(0,0,0,${alpha})`
+  const r = parseInt(s.slice(0, 2), 16)
+  const g = parseInt(s.slice(2, 4), 16)
+  const b = parseInt(s.slice(4, 6), 16)
+  return `rgba(${r},${g},${b},${alpha})`
+}
 
 function hashString(input: string) {
   let h = 0
@@ -41,25 +41,27 @@ function hashString(input: string) {
 function InspirationCard({
   item,
   onCreate,
+  onEdit,
   onDelete,
 }: {
   item: Material
   onCreate: () => void
+  onEdit: () => void
   onDelete: () => void
 }) {
   const seed = item.topicTags[0] ?? item.id
-  const tint = cardTints[Math.abs(hashString(seed)) % cardTints.length]
+  const tintFromIndex =
+    item.tintIndex !== undefined && Number.isFinite(item.tintIndex)
+      ? cardTints[Math.max(0, item.tintIndex) % cardTints.length]
+      : null
+  const tint = tintFromIndex ?? cardTints[Math.abs(hashString(seed)) % cardTints.length]
 
   return (
     <div
       className="group relative break-inside-avoid overflow-hidden rounded-[14px] border border-border-muted bg-surface transition-[transform,box-shadow] duration-200 shadow-[0_1px_3px_rgba(0,0,0,0.04)] group-hover:shadow-[0_8px_24px_rgba(0,0,0,0.06)] group-hover:-translate-y-[2px]"
-      style={{ background: '#FFFFFF' }}
+      style={{ background: tint.bg }}
     >
-      <div
-        aria-hidden
-        className="absolute left-0 top-0 bottom-0 w-[4px] opacity-0 transition-opacity duration-200 group-hover:opacity-100"
-        style={{ background: tint.accent }}
-      />
+      <div aria-hidden className="absolute left-0 top-0 bottom-0 w-[4px]" style={{ background: tint.accent }} />
 
       {item.imageDataUrl ? (
         <div className="relative">
@@ -92,22 +94,41 @@ function InspirationCard({
         ) : null}
       </div>
 
-      <div className="flex items-center justify-between border-t border-[#F5F5F5] px-[18px] pb-[12px] pt-[8px] opacity-100 transition-opacity duration-150 md:opacity-0 md:group-hover:opacity-100">
+      <div className="flex items-center justify-between border-t border-border-muted px-[18px] pb-[12px] pt-[10px]">
         <span className="text-[11px] font-normal text-[#CCC]">{formatMaterialDate(item.createdAt)}</span>
 
-        <div className="flex items-center gap-[8px]">
+        <div
+          className="flex items-center gap-[8px]"
+          style={{ ['--card-accent' as string]: tint.accent }}
+        >
           <button
             type="button"
             onClick={onCreate}
-            className="rounded-[14px] px-[12px] py-[4px] text-[11px] font-medium"
-            style={{ background: CARD_R10, color: CARD_R }}
+            className="rounded-full px-[12px] py-[4px] text-[11px] font-medium tracking-[0.3px] transition-colors hover:opacity-90"
+            style={{ background: accentSoftFill(tint.accent), color: tint.accent }}
           >
             基于此素材创作
           </button>
           <button
             type="button"
+            onClick={onEdit}
+            className="rounded-full p-[4px] text-[#CCC] transition-colors hover:text-[var(--card-accent)]"
+            aria-label="编辑"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+              <path
+                d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </button>
+          <button
+            type="button"
             onClick={onDelete}
-            className="rounded-[14px] p-[4px] text-[#CCC] hover:text-[#FF2442]"
+            className="rounded-full p-[4px] text-[#CCC] transition-colors hover:text-[var(--card-accent)]"
             aria-label="删除"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -126,12 +147,17 @@ function InspirationCard({
   )
 }
 
+function uidNonce() {
+  const c = (globalThis as unknown as { crypto?: { randomUUID?: () => string } }).crypto
+  return c?.randomUUID?.() ?? `n_${Date.now()}_${Math.random().toString(16).slice(2)}`
+}
+
 export default function MaterialBankPage() {
   const navigate = useNavigate()
-  const { activeAccount } = useActiveAccount()
   const [materials, setMaterials] = useState<Material[]>(() => loadMaterials())
   const [search, setSearch] = useState('')
   const [isModalOpen, setIsModalOpen] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
 
   const [formContent, setFormContent] = useState('')
   const [formImageDataUrl, setFormImageDataUrl] = useState<string | null>(null)
@@ -142,8 +168,16 @@ export default function MaterialBankPage() {
 
   function closeModal() {
     setIsModalOpen(false)
+    setEditingId(null)
     setFormContent('')
     setFormImageDataUrl(null)
+  }
+
+  function openEditMaterial(m: Material) {
+    setEditingId(m.id)
+    setFormContent(m.content)
+    setFormImageDataUrl(m.imageDataUrl ?? null)
+    setIsModalOpen(true)
   }
 
   const filtered = useMemo(() => {
@@ -155,34 +189,36 @@ export default function MaterialBankPage() {
     })
   }, [materials, search])
 
-  const col1 = useMemo(() => filtered.filter((_, i) => i % 3 === 0), [filtered])
-  const col2 = useMemo(() => filtered.filter((_, i) => i % 3 === 1), [filtered])
-  const col3 = useMemo(() => filtered.filter((_, i) => i % 3 === 2), [filtered])
-
-  function draftFromMaterial(mat: Material): Draft {
-    const overlayText = mat.topicTags[0] ?? activeAccount.name
-    const body = [
-      mat.content,
-      `我希望把这份素材写成一段“读者能代入”的体验：从一个细节切入，再把感受收束成结尾的钩子。`,
-      `最后我会用 1-2 句总结适合谁，以及你到店/使用时可以怎么做。`,
-    ].join('\n\n')
-
-    return {
-      title: `基于素材创作：${overlayText} 的探店笔记`,
-      body,
-      tags: [...mat.topicTags].slice(0, 6),
-      cover: {
-        type: 'photo',
-        description: '',
-        overlayText,
-        imageUrl: mat.imageDataUrl,
-      },
+  function handleCreateFromMaterial(material: Material) {
+    const state: WorkspaceLocationState = {
+      autoMessage: `帮我改\n\n素材内容：\n${material.content}`,
+      materialImage: material.imageDataUrl ?? null,
+      sourceMaterialId: material.id,
+      nonce: uidNonce(),
     }
+    navigate('/workspace', { state })
   }
 
   function handleSave() {
     const text = formContent.trim()
-    if (formImageDataUrl) {
+    if (editingId) {
+      if (formImageDataUrl) {
+        updateMaterial(editingId, {
+          type: 'photo',
+          content: text || '图片素材',
+          imageDataUrl: formImageDataUrl,
+        })
+      } else {
+        if (!text) {
+          alert('内容不能为空')
+          return
+        }
+        updateMaterial(editingId, {
+          type: 'text',
+          content: text,
+        })
+      }
+    } else if (formImageDataUrl) {
       addMaterial({
         type: 'photo',
         content: text || '图片素材',
@@ -207,8 +243,8 @@ export default function MaterialBankPage() {
   const canSave = formImageDataUrl !== null || formContent.trim().length > 0
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-canvas p-4 font-sans">
-      <div className="mx-auto flex min-h-0 w-full max-w-[960px] flex-1 flex-col overflow-hidden">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-canvas p-4 font-sans">
+      <div className="mx-auto flex min-h-0 min-w-0 w-full max-w-[min(100%,1920px)] flex-1 flex-col overflow-hidden px-1 sm:px-2">
         <div className="mb-5 flex flex-wrap items-center justify-between gap-4">
           <input
             value={search}
@@ -218,7 +254,12 @@ export default function MaterialBankPage() {
           />
           <button
             type="button"
-            onClick={() => setIsModalOpen(true)}
+            onClick={() => {
+              setEditingId(null)
+              setFormContent('')
+              setFormImageDataUrl(null)
+              setIsModalOpen(true)
+            }}
             className="inline-flex items-center gap-1.5 rounded-full bg-primary px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/90"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -229,59 +270,21 @@ export default function MaterialBankPage() {
           </button>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto pr-1">
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-3 md:items-start">
-            <div className="flex flex-col gap-3">
-              {col1.map((m) => (
-                <InspirationCard
-                  key={m.id}
-                  item={m}
-                  onCreate={() => {
-                    setPendingDraft(draftFromMaterial(m))
-                    navigate('/')
-                  }}
-                  onDelete={() => {
-                    if (!confirm('确认删除该素材？')) return
-                    deleteMaterial(m.id)
-                    refresh()
-                  }}
-                />
-              ))}
-            </div>
-            <div className="flex flex-col gap-3">
-              {col2.map((m) => (
-                <InspirationCard
-                  key={m.id}
-                  item={m}
-                  onCreate={() => {
-                    setPendingDraft(draftFromMaterial(m))
-                    navigate('/')
-                  }}
-                  onDelete={() => {
-                    if (!confirm('确认删除该素材？')) return
-                    deleteMaterial(m.id)
-                    refresh()
-                  }}
-                />
-              ))}
-            </div>
-            <div className="flex flex-col gap-3">
-              {col3.map((m) => (
-                <InspirationCard
-                  key={m.id}
-                  item={m}
-                  onCreate={() => {
-                    setPendingDraft(draftFromMaterial(m))
-                    navigate('/')
-                  }}
-                  onDelete={() => {
-                    if (!confirm('确认删除该素材？')) return
-                    deleteMaterial(m.id)
-                    refresh()
-                  }}
-                />
-              ))}
-            </div>
+        <div className="min-h-0 min-w-0 w-full flex-1 overflow-y-auto overflow-x-hidden pr-1">
+          <div className="grid w-full min-w-0 items-start gap-3 [grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr))]">
+            {filtered.map((m) => (
+              <InspirationCard
+                key={m.id}
+                item={m}
+                onCreate={() => handleCreateFromMaterial(m)}
+                onEdit={() => openEditMaterial(m)}
+                onDelete={() => {
+                  if (!confirm('确认删除该素材？')) return
+                  deleteMaterial(m.id)
+                  refresh()
+                }}
+              />
+            ))}
           </div>
         </div>
       </div>
@@ -297,7 +300,7 @@ export default function MaterialBankPage() {
             onClick={(e) => e.stopPropagation()}
             role="dialog"
             aria-modal="true"
-            aria-label="新建灵感"
+            aria-label={editingId ? '编辑灵感' : '新建灵感'}
           >
             <div className="px-7 pt-8 pb-6">
               <textarea
