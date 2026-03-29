@@ -3,9 +3,13 @@ import { useNavigate } from 'react-router-dom'
 import type { HotTopic } from '../../types/hotspot'
 import HeatBar from './HeatBar'
 import SourceChip from './SourceChip'
-import { setPendingDraft } from '../../lib/ideashuStorage'
-import type { Draft } from '../XhsPostEditor'
+import type { WorkspaceLocationState } from '../../lib/workspaceLocationState'
 import { useActiveAccount } from '../../contexts/ActiveAccountContext'
+
+function uidNonce() {
+  const c = (globalThis as unknown as { crypto?: { randomUUID?: () => string } }).crypto
+  return c?.randomUUID?.() ?? `n_${Date.now()}_${Math.random().toString(16).slice(2)}`
+}
 
 function hostOrOpenLabel(url: string, domain?: string): string {
   if (domain && domain.trim().length > 0) return domain.trim()
@@ -25,18 +29,18 @@ function formatPublishedLine(iso: string): string {
 function trendBadge(trend: HotTopic['heat']['trend']) {
   switch (trend) {
     case 'exploding':
-      return { label: '爆发', icon: '🔥', color: '#ef4444' }
+      return { label: '爆发', icon: '🔥', bg: 'bg-red-50', text: 'text-red-600', border: 'border-red-100' }
     case 'rising':
-      return { label: '上升', icon: '📈', color: '#f97316' }
+      return { label: '上升', icon: '📈', bg: 'bg-amber-50', text: 'text-amber-700', border: 'border-amber-100' }
     case 'declining':
-      return { label: '下降', icon: '📉', color: '#6b7280' }
+      return { label: '回落', icon: '📉', bg: 'bg-gray-50', text: 'text-gray-500', border: 'border-gray-100' }
     default:
-      return { label: '稳定', icon: '〰️', color: '#6b7280' }
+      return { label: '稳定', icon: '〰️', bg: 'bg-gray-50', text: 'text-gray-500', border: 'border-gray-100' }
   }
 }
 
-function draftFromHotTopic(t: HotTopic, accountName: string): Draft {
-  const overlayText = (t.title || '').slice(0, 7)
+/** 发到对话里，由 Skill 先问答再出稿；不预填右侧编辑器 */
+function messageFromHotTopic(t: HotTopic, accountName: string): string {
   const lines: string[] = []
   lines.push(`我想用这个热点做一篇更像真实体验的笔记：${t.title}`)
   lines.push(`来源：${t.source.type}（${t.source.primarySource.platform}）`)
@@ -48,36 +52,7 @@ function draftFromHotTopic(t: HotTopic, accountName: string): Draft {
   lines.push('')
   lines.push('请先问我 3 个最关键的素材问题，再进入 ideashu-v5 的写作流程。')
   lines.push(`账号：${accountName}`)
-
-  return {
-    title: t.title,
-    body: lines.join('\n'),
-    tags: [t.title].filter(Boolean).slice(0, 1),
-    cover: {
-      type: 'photo',
-      description: '',
-      overlayText: overlayText || accountName,
-      imageUrl: undefined,
-    },
-  }
-}
-
-function PrimaryLinkIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-      aria-hidden
-    >
-      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
-      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
-    </svg>
-  )
+  return lines.join('\n')
 }
 
 export default function HotCard({
@@ -90,114 +65,131 @@ export default function HotCard({
   onDismiss: (id: string) => void
 }) {
   const navigate = useNavigate()
-  const { activeAccount, activeAccountId } = useActiveAccount()
+  const { activeAccount } = useActiveAccount()
   const trend = useMemo(() => trendBadge(topic.heat.trend), [topic.heat.trend])
   const primaryUrl = topic.source.primarySource.url?.trim() || ''
   const publishedAt = topic.source.primarySource.publishedAt?.trim()
-  const listUpdatedLine = topic.date ? formatPublishedLine(topic.date) : ''
+  const sourcePlatform = topic.source.primarySource.platform || topic.source.type || ''
 
   return (
     <div
-      className="bg-surface border border-border-muted rounded-2xl p-5 transition-[box-shadow,border-color] duration-200 hover:shadow-[0_10px_30px_rgba(0,0,0,0.06)] hover:border-text-main/15"
-      style={{ animationDelay: `${index * 60}ms` }}
+      className="group relative bg-white rounded-2xl border border-stone-200/60 transition-all duration-300 hover:border-stone-300 hover:shadow-[0_8px_30px_rgba(120,113,108,0.08)]"
+      style={{
+        animationDelay: `${index * 50}ms`,
+        animationFillMode: 'both',
+      }}
     >
-      <div className="flex items-center gap-2 flex-wrap mb-2">
-        {topic.materialMatch ? (
-          <span className="rounded-md border border-green-500/25 bg-green-500/10 px-2 py-1 text-[11px] font-extrabold text-green-700">
-            ✅ 有 {topic.materialCount} 条素材匹配
-          </span>
-        ) : null}
+      {/* 顶部色条 */}
+      <div
+        className="h-1 rounded-t-2xl"
+        style={{
+          background: topic.heat.score >= 75
+            ? 'linear-gradient(90deg, #ef4444 0%, #f97316 100%)'
+            : topic.heat.score >= 65
+              ? 'linear-gradient(90deg, #f97316 0%, #fbbf24 100%)'
+              : 'linear-gradient(90deg, #a8a29e 0%, #d6d3d1 100%)',
+        }}
+      />
 
-        <div className="ml-auto flex items-center gap-3">
-          <span className="text-[12px] font-bold" style={{ color: trend.color }}>
-            {trend.icon} {trend.label}
-          </span>
-          <HeatBar value={topic.heat.score} />
-        </div>
-      </div>
-
-      <div className="flex items-start gap-4">
-        <div className="min-w-0 flex-1">
-          <div className="text-[17px] font-black text-text-main leading-snug">{topic.title}</div>
-
-          <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px]">
-            <span className="inline-flex shrink-0 text-text-tertiary" title="原始链接" aria-label="原始链接">
-              <PrimaryLinkIcon className="h-4 w-4" />
-            </span>
-            {primaryUrl ? (
-              <>
-                <a
-                  href={primaryUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="min-w-0 font-semibold text-primary underline decoration-primary/30 underline-offset-2 hover:decoration-primary"
-                  title={primaryUrl}
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  {hostOrOpenLabel(primaryUrl, topic.source.primarySource.domain)}
-                  <span className="ml-1 text-[12px] opacity-70">↗</span>
-                </a>
-                <span className="shrink-0 text-[12px] font-medium text-text-tertiary">
-                  {publishedAt ? (
-                    <>· {formatPublishedLine(publishedAt)}</>
-                  ) : (
-                    <>
-                      · 发布时间未提供
-                      {listUpdatedLine ? (
-                        <span className="text-text-tertiary/80" title="本列表拉取时间，非原文发布时间">
-                          {' '}
-                          · 列表更新 {listUpdatedLine}
-                        </span>
-                      ) : null}
-                    </>
-                  )}
-                </span>
-              </>
-            ) : (
-              <span className="text-[12px] font-medium text-text-tertiary">
-                无。请让助手为该条补充 https 的 sourceUrl。
+      <div className="px-5 py-4">
+        {/* 第一行：标签 + 热度 */}
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <div className="flex items-center gap-2 min-w-0">
+            {topic.materialMatch ? (
+              <span className="inline-flex items-center gap-1 shrink-0 rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-bold text-emerald-700 border border-emerald-100">
+                ✅ {topic.materialCount} 条素材
               </span>
-            )}
+            ) : null}
+            {sourcePlatform ? (
+              <span className="inline-flex items-center shrink-0 rounded-full bg-stone-50 px-2.5 py-1 text-[11px] font-semibold text-stone-500 border border-stone-100">
+                {sourcePlatform}
+              </span>
+            ) : null}
           </div>
 
-          {topic.source.relatedSources.length > 0 ? (
-            <div className="mt-2 flex flex-wrap gap-2">
-              {topic.source.relatedSources.slice(0, 3).map((s) => (
-                <SourceChip key={`${s.platform}:${s.url}`} source={s} />
-              ))}
+          <div className="flex items-center gap-2.5 shrink-0">
+            <span className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-bold border ${trend.bg} ${trend.text} ${trend.border}`}>
+              {trend.icon} {trend.label}
+            </span>
+            <HeatBar value={topic.heat.score} />
+          </div>
+        </div>
+
+        {/* 标题 */}
+        <h3 className="text-[16px] font-extrabold text-stone-800 leading-relaxed tracking-tight">
+          {topic.title}
+        </h3>
+
+        {/* 来源链接 / 无链接提示 */}
+        <div className="mt-2 text-[12px]">
+          {primaryUrl ? (
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <a
+                href={primaryUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 font-semibold text-stone-600 hover:text-stone-900 underline decoration-stone-300 underline-offset-2 hover:decoration-stone-500 transition-colors"
+                title={primaryUrl}
+                onClick={(e) => e.stopPropagation()}
+              >
+                {hostOrOpenLabel(primaryUrl, topic.source.primarySource.domain)}
+                <span className="text-[10px]">↗</span>
+              </a>
+              {publishedAt ? (
+                <span className="text-stone-400">· {formatPublishedLine(publishedAt)}</span>
+              ) : null}
+            </div>
+          ) : (
+            <span className="text-stone-400">基于多源检索聚合，暂无直链</span>
+          )}
+        </div>
+
+        {topic.source.relatedSources.length > 0 ? (
+          <div className="mt-2.5 flex flex-wrap gap-1.5">
+            {topic.source.relatedSources.slice(0, 3).map((s) => (
+              <SourceChip key={`${s.platform}:${s.url}`} source={s} />
+            ))}
+          </div>
+        ) : null}
+
+        {/* 切入角度 + 钩子 */}
+        <div className="mt-3.5 flex flex-wrap gap-2">
+          {topic.tags.cutIn && topic.tags.cutIn !== '—' ? (
+            <div className="flex-1 min-w-[200px] rounded-xl bg-stone-50/80 border border-stone-100 px-3.5 py-2.5">
+              <div className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1">切入角度</div>
+              <div className="text-[12px] font-medium text-stone-600 leading-relaxed">{topic.tags.cutIn}</div>
+            </div>
+          ) : null}
+          {topic.tags.hook && topic.tags.hook !== '—' ? (
+            <div className="shrink-0 rounded-xl bg-stone-50/80 border border-stone-100 px-3.5 py-2.5">
+              <div className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1">钩子</div>
+              <div className="text-[12px] font-semibold text-stone-600">{topic.tags.hook}</div>
             </div>
           ) : null}
         </div>
 
-        <div className="shrink-0 flex flex-col items-end gap-2">
-          <button
-            type="button"
-            onClick={() => {
-              setPendingDraft(activeAccountId, draftFromHotTopic(topic, activeAccount.name))
-              navigate('/workspace')
-            }}
-            className="px-4 py-2 rounded-lg bg-text-main text-white font-extrabold text-[13px] hover:bg-black/80 transition-colors"
-          >
-            用这个写 →
-          </button>
+        {/* 操作按钮 */}
+        <div className="mt-4 flex items-center justify-end gap-2">
           <button
             type="button"
             onClick={() => onDismiss(topic.id)}
-            className="px-4 py-2 rounded-lg border border-border-muted text-text-secondary font-bold text-[12px] hover:border-text-main/20 hover:text-text-main transition-colors"
+            className="px-3.5 py-1.5 rounded-lg text-[12px] font-semibold text-stone-400 hover:text-stone-600 hover:bg-stone-50 transition-colors"
           >
             不感兴趣
           </button>
-        </div>
-      </div>
-
-      <div className="mt-3 flex flex-wrap gap-2">
-        <div className="flex items-center gap-2 rounded-lg bg-black/[0.02] border border-black/5 px-3 py-1.5 text-[12px]">
-          <span className="font-bold text-text-tertiary">切入：</span>
-          <span className="font-semibold text-text-secondary">{topic.tags.cutIn}</span>
-        </div>
-        <div className="flex items-center gap-2 rounded-lg bg-black/[0.02] border border-black/5 px-3 py-1.5 text-[12px]">
-          <span className="font-bold text-text-tertiary">钩子：</span>
-          <span className="font-semibold text-text-secondary">{topic.tags.hook}</span>
+          <button
+            type="button"
+            onClick={() => {
+              const state: WorkspaceLocationState = {
+                autoMessage: messageFromHotTopic(topic, activeAccount.name),
+                nonce: uidNonce(),
+              }
+              navigate('/workspace', { state })
+            }}
+            className="px-4 py-2 rounded-xl bg-stone-800 text-white font-bold text-[12px] hover:bg-stone-700 active:scale-[0.98] transition-all shadow-sm"
+          >
+            用这个写 →
+          </button>
         </div>
       </div>
     </div>

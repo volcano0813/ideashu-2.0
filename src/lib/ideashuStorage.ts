@@ -408,16 +408,23 @@ export function setPendingDraft(accountId: string, draft: Draft) {
   }
 }
 
+/** Read pending draft without removing (e.g. before deferred consume in Strict Mode). */
+export function peekPendingDraft(accountId: string): Draft | null {
+  if (!accountId) return null
+  return safeParseJSON<Draft>(localStorage.getItem(pendingDraftKey(accountId)))
+}
+
 export function consumePendingDraft(accountId: string): Draft | null {
   if (!accountId) return null
   const raw = localStorage.getItem(pendingDraftKey(accountId))
   if (!raw) return null
+  const parsed = safeParseJSON<Draft>(raw)
   try {
     localStorage.removeItem(pendingDraftKey(accountId))
   } catch {
     // ignore
   }
-  return safeParseJSON<Draft>(raw)
+  return parsed
 }
 
 export function setPendingPublish(accountId: string, pending: PendingPublish) {

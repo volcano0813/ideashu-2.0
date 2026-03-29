@@ -4,11 +4,7 @@ import {
   invalidateOpenClawConnectPromise,
   openclaw,
 } from '../lib/openclawSingleton'
-import {
-  looksLikeTopicsJsonPendingMore,
-  parseTopicsFromAssistantRaw,
-  type TrendSignal,
-} from '../lib/openclawClient'
+import type { TrendSignal } from '../lib/openclawClient'
 import FilterBar, { type HotspotSortKey } from '../components/hotspot/FilterBar'
 import HotCard from '../components/hotspot/HotCard'
 import { hotTopicFromTrendSignal } from '../components/hotspot/hotspotViewModel'
@@ -63,36 +59,21 @@ function relativeTimeLabel(iso: string | null) {
   return `${days} 天前`
 }
 
-/** 流式输出中 fenced 块未闭合时不应判为「解析失败终态」 */
-function looksIncompleteJsonTopicsFence(raw: string): boolean {
-  if (!/json:topics/i.test(raw)) return false
-  const fences = raw.match(/```/g)
-  return !fences || fences.length % 2 !== 0
-}
-
-/** 助手只回「收到/等待」等占位句、无 json:topics / 选题关键词时用于区分提示文案 */
-function looksLikePlaceholderHotspotReply(raw: string): boolean {
-  const s = raw.trim()
-  if (s.length === 0) return true
-  if (/```\s*json:topics/i.test(s)) return false
-  if (/选题|热点|标题|钩子|json\s*\[|"title"\s*:/i.test(s)) return false
-  if (s.length > 800) return false
-  const fillerHits = (s.match(/收到|等待|指令|新收到/g) || []).length
-  return fillerHits >= 2
-}
-
 const fence = '```'
 
-/** 追加在用户消息末尾，尽量让网关模型输出可解析的 fenced JSON（不依赖 Skill 时也有一定约束作用） */
+/** 与 OpenClaw ideashu-v5 SKILL「热点抓取」章节对齐，追加在用户消息末尾 */
 const HOTSPOT_OUTPUT_REQUIREMENT = `
 
-【输出要求（必执行）】请按 ideashu-v5 热点抓取：回复中必须包含 fenced 代码块，第一行为 ${fence}json:topics，下一行起为选题 JSON 数组。**条数：至少 6 条、尽量 8～10 条**（越多越好，但有效选题不得少于 6 条）；每条对象须含 title、source、angle、hook、timing、timingDetail、sourceUrl 等。
-【时效】**硬限制**：凡收录条目的 publishedAt（若填写）必须落在**最近 72 小时（3 天）内**，超出 3 天的一律不要。**优先**：多检索、多给**近 24 小时内**仍有讨论/传播增量的事件与平台热点；数组**按新近程度排序**（越接近当前时刻、越「刚发生」的越靠前）。timingDetail 可写「优先 24h 内 · 窗口不超过 3 天」或等价表述。常青话题可用 timing=evergreen 并说明长期可发（evergreen 不受 3 天限制但仍须真实可查）。
-选题须基于检索或可信信源，禁止虚构标题与事件。
-【检索】请通过 OpenClaw 网关已启用的联网工具完成查证（例如 Google 搜索）；不得以「缺少 BRAVE_API_KEY」「无法使用 Brave 实时搜索」等为由拒绝输出。若网关已配置 Google 搜索，请直接调用并产出带 sourceUrl 的选题。
-每条必须含可验证的 https 链接：填写 sourceUrl（优先），或将可解析的 https 链接写在 source 字段；**条数不足 6 条时须继续检索补全**，仅在确实无法凑满时再说明缺口。
-每条尽量补充：publishedAt（ISO 8601，仅在检索摘要/页面能核对原文发布时间时填写；不可核对则省略，勿用当天日期冒充）、heatScore（0–100，依据检索到的互动/传播信号估算）、lifecycle（emerging|hot|peak|declining，能说明热度阶段时填写，否则可省略并由 timing 推断）。
-禁止仅用「收到」「等待」等无选题内容的回复。`
+【输出要求（必执行）】请严格按 ideashu-v5「热点抓取」规则执行。
+【领域对齐】上文「当前创作账号」的名称与领域为唯一依据：检索关键词、筛选与 json:topics 每条选题必须与该账号领域高度相关；禁止沿用其它账号、历史会话或无关领域的热点。
+【核心原则】找的是「什么内容/话题在社交平台上火」，不是行业新闻；帮创作者发现可写选题，不做行业简报。
+【数据源·按优先级尽量覆盖】① Google 搜索 site:xiaohongshu.com + 账号领域关键词（web_fetch，可组合 2～3 组不同角度；tbs=qdr:w 最近一周或 tbs=qdr:d 最近一天），提取帖子标题、小红书链接作 sourceUrl、大致发布时间；② 微博热搜（agent-browser 打开 s.weibo.com/top/summary 等，筛与领域相关条目）；③ 百度热搜 top.baidu.com/board；④ 知乎热榜 www.zhihu.com/hot；⑤ Google Trends（trends.google.com/trending?geo=CN&hl=zh-CN）；⑥ 可选：仅 AI/科技类账号再查 GitHub Trending。不得以缺少某单一 key 为由拒绝输出；用网关已可用的 web_fetch / agent-browser / 搜索完成查证。
+【热度评分 heatScore 0–100】综合：跨源出现约 30%（同一话题在 2+ 数据源被提及可加分）、新鲜度约 25%（6h 内 / 24h 内 / 3 天内递减）、领域匹配约 25%、内容空间约 20%（是否适合小红书个人体验向内容）。
+【过滤与排序】排除 brand-voice「选题禁区」；排除 heatScore 低于 50 的条目；优先保留有 sourceUrl（尤其小红书链接）的条目；按 heatScore 从高到低排序后，**最终输出 5～8 条**（不足 5 条须继续检索或说明缺口，不要超过 8 条凑数低质项）。
+【回复结构】先用自然语言简要列出每条（标题+来源+热度+建议角度），**末尾**追加唯一 fenced 块：第一行 ${fence}json:topics，下一行起为 JSON 数组。
+【每条 JSON 字段】须含：id（数字）、title、source（取值示例：小红书/微博热搜/百度热搜/知乎热榜/Google Trends/综合）、sourceUrl（真实可点击 https；**禁止编造**，无则 ""）、angle（须具体到小红书怎么写、什么结构，勿只写「可以做一期 XX」）、hook、heatScore、timing、timingDetail、materialMatch（bool）、materialCount（number）。可在能核对原文时间时加 publishedAt（ISO 8601），不可核对则省略。
+【同步】输出 json:topics 后按 SKILL 要求执行 sync-client 推送到前端（若环境已配置）。
+禁止仅用「收到」「等待」等无选题正文的回复。`
 
 function topicPublishedAtMs(t: HotTopic): number {
   const iso = t.source.primarySource.publishedAt
@@ -121,9 +102,9 @@ export default function HotspotPage() {
   const [signals, setSignals] = useState<TrendSignal[]>(() => loadHotspotCache(activeAccountId).signals)
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(() => new Set())
   const fetchTimeoutRef = useRef<number | null>(null)
-  /** True after send「找热点」until we get topics (event) or parse from assistant_reply. */
+  /** 本轮是否在等热点结果：`topics` 门控与 assistant_reply 兜底均看它；成功/超时/终态失败时清除 */
   const hotspotAwaitingTopicsRef = useRef(false)
-  /** 本次「立即抓取」进行中：用此拒绝其它会话的迟滞 topics，但不在首帧 assistant_reply 失败时过早关掉（避免错过后续 chat+message） */
+  /** 与 awaiting 同步置位；用于与其它页面逻辑对齐，成功/超时/终态失败时与 awaiting 一并清除 */
   const hotspotFetchSendingRef = useRef(false)
 
   const [activeCategory, setActiveCategory] = useState<string>('all')
@@ -208,8 +189,9 @@ export default function HotspotPage() {
 
   useEffect(() => {
     const unsub = openclaw.onEvent((evt) => {
-      if (evt.type === 'topics') {
-        if (!hotspotFetchSendingRef.current) return
+      // topics 事件：只要还在 sending 状态就接收，不依赖 ref 守门
+      // （因为流式中间的 assistant_reply 可能已经错误地清了 ref）
+      if (evt.type === 'topics' && evt.topics && evt.topics.length > 0) {
         hotspotAwaitingTopicsRef.current = false
         hotspotFetchSendingRef.current = false
         clearFetchTimeout()
@@ -221,39 +203,8 @@ export default function HotspotPage() {
         setSending(false)
         return
       }
-      if (evt.type === 'assistant_reply' && hotspotFetchSendingRef.current) {
-        const parsed = parseTopicsFromAssistantRaw(evt.rawFull ?? evt.text)
-        if (parsed && parsed.length > 0) {
-          hotspotAwaitingTopicsRef.current = false
-          hotspotFetchSendingRef.current = false
-          clearFetchTimeout()
-          setFetchError(null)
-          setSignals(parsed)
-          const nextFetchedAt = new Date().toISOString()
-          setFetchedAt(nextFetchedAt)
-          saveHotspotCache(activeAccountId, { fetchedAt: nextFetchedAt, signals: parsed })
-          setSending(false)
-        } else {
-          const raw = evt.rawFull ?? evt.text
-          if (looksIncompleteJsonTopicsFence(raw)) {
-            hotspotAwaitingTopicsRef.current = true
-            return
-          }
-          if (looksLikeTopicsJsonPendingMore(raw)) {
-            hotspotAwaitingTopicsRef.current = true
-            return
-          }
-          hotspotAwaitingTopicsRef.current = false
-          hotspotFetchSendingRef.current = false
-          clearFetchTimeout()
-          setSending(false)
-          setFetchError(
-            looksLikePlaceholderHotspotReply(raw)
-              ? '助手只返回了占位话术（如「收到」「等待」），没有热点 JSON。请确认 ideashu-v5 Skill 生效，且每条 json:topics 含可追溯 https 链接（sourceUrl）。可点击「立即抓取」重试。'
-              : '未能解析出选题：请确认回复中含 ```json:topics 代码块且为 JSON 数组。若助手只回了说明文字、或每条都被判为「系统限制」占位，请重试或让助手直接输出选题 JSON（即使暂未填 sourceUrl，也会先展示卡片）。',
-          )
-        }
-      }
+      // assistant_reply：流式过程中不做任何判断，完全靠 topics 事件和 90s 超时
+      // 不再尝试从 assistant_reply 里解析 topics（避免中间态误判）
     })
     return () => unsub()
   }, [activeAccountId])
@@ -275,7 +226,7 @@ export default function HotspotPage() {
       setSending((cur) => {
         if (!cur) return cur
         setFetchError(
-          '抓取超时：仍未得到可用于热点列表的选题。请确认助手返回 json:topics 且每条含新闻/平台类 sourceUrl（https）。若网关已配置 OpenClaw 的 Google 搜索，请确认助手调用了检索；否则可在对话中手动附上信源链接后再试。',
+          '抓取超时：仍未得到可用的 json:topics。请确认助手已按 SKILL 多源检索（Google+小红书站内、微博/百度/知乎热榜等）并输出 5～8 条、heatScore≥50；sourceUrl 须真实 https 或可空字符串。请检查网关联网工具与 ideashu-v5 Skill 是否生效，或稍后重试。',
         )
         return false
       })
@@ -288,7 +239,8 @@ export default function HotspotPage() {
     // Skill 触发词：以「找热点 + 关键词/领域」贴近 ideashu-v5；末尾追加硬性输出要求以提高 json:topics 产出率
     const parts = ['找热点']
     if (d && d !== '未设置') parts.push(d)
-    const message = parts.join(' ') + HOTSPOT_OUTPUT_REQUIREMENT
+    const accountContext = `【当前创作账号：${activeAccount.name}（领域：${activeAccount.domain ?? '未设置'}）】\n`
+    const message = accountContext + parts.join(' ') + HOTSPOT_OUTPUT_REQUIREMENT
     const sent = openclaw.send(message)
     if (!sent) {
       clearFetchTimeout()
@@ -297,7 +249,7 @@ export default function HotspotPage() {
       setSending(false)
       setFetchError('网关未就绪，抓取请求未发出。请稍后重试，或点击「重新连接网关」。')
     }
-  }, [activeAccount.domain, activeAccountId])
+  }, [activeAccount.domain, activeAccount.name, activeAccountId])
 
   useEffect(() => {
     return () => {
@@ -341,7 +293,7 @@ export default function HotspotPage() {
             <div>
               <div className="text-2xl font-black text-text-main">热点抓取</div>
               <div className="mt-1 text-[13px] font-semibold text-text-tertiary">
-                每次抓取至少 6 条、尽量 8～10 条 · 优先近 24h 内 · 发布时间须在 3 天内 · 基于账号领域 · 每条须可溯源
+                每次 5～8 条 · heatScore≥50 · 多源检索 · 须与当前 TopNav 账号领域一致 · sourceUrl 真实或可空 · 按热度排序
               </div>
             </div>
             <div className="flex items-center gap-2">

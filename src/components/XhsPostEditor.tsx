@@ -2,11 +2,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useActiveAccount } from '../contexts/ActiveAccountContext'
-import {
-  compositeCoverFromImageSource,
-  generateCoverPreview,
-  revokeCoverObjectUrl,
-} from '../lib/coverCanvas'
 import { persistableImageUrl } from '../lib/imageCompress'
 import {
   addStyleSampleFromPost,
@@ -77,6 +72,13 @@ type Props = {
   onResetDraftSession?: () => void
   /** 用户点击「看我的修改规律」时由工作台发 Skill */
   onRequestStyleAnalysis?: () => void
+  /** 用户确认封面建议后，由工作台向网关发消息触发 ```json:cover``` 生图 */
+  onRequestCoverGeneration?: (args: {
+    wireMessage: string
+    imageDataUrl?: string
+    /** true 时走素材库 + img2img 话术（用户已上传底图） */
+    useUploadedImageAsCoverBase?: boolean
+  }) => void
 }
 
 function clamp(n: number, min: number, max: number) {
@@ -89,6 +91,70 @@ function normalizeDraftBody(text: string) {
 
 function countChars(s: string) {
   return (s ?? '').length
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader()
+    r.onload = () => resolve(String(r.result))
+    r.onerror = () => reject(new Error('read failed'))
+    r.readAsDataURL(file)
+  })
+}
+
+/** 草稿一有内容即可展示，不依赖 Skill 先返回 cover.description */
+function buildLocalCoverSuggestion(title: string, body: string, tags: string[]): string {
+  const t = title.trim()
+  const b = body.trim().replace(/\s+/g, ' ')
+  const snippet = b.length > 160 ? `${b.slice(0, 160)}…` : b
+  const tagHint = tags.length ? `可呼应标签：${tags.slice(0, 4).join('、')}` : ''
+  if (!t && !snippet) return '完善标题或正文后，这里会给出封面画面建议。'
+  return [
+    '竖版约 3:4，生活化光影与真实场景，留白给大字标题区。',
+    t ? `视觉锚点：${t}` : '',
+    snippet ? `画面叙事：${snippet}` : '',
+    tagHint,
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+/** 仅用于发往对话的封面设计提示（不含正文摘录），无 Skill 描述时与 buildLocalCoverSuggestion 解耦 */
+function buildCoverWireDesignPrompt(title: string, tags: string[]): string {
+  const t = title.trim()
+  const tagHint = tags.length ? `可呼应标签：${tags.slice(0, 2).join('、')}` : ''
+  if (!t && !tagHint) {
+    return '竖版约 3:4，生活化光影与真实场景，留白给大字标题区。'
+  }
+  return [
+    '竖版约 3:4，生活化光影与真实场景，留白给大字标题区。',
+    t ? `视觉锚点：${t}` : '',
+    tagHint,
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+function composeCoverWireMessage(params: {
+  title: string
+  suggestion: string
+  overlayText: string
+  mode: 'text2img' | 'img2img'
+}): string {
+  const { title, suggestion, overlayText, mode } = params
+  const modeLine =
+    mode === 'img2img'
+      ? '生成模式：img2img（已随消息附带用户上传的底图素材，请以此为底生成封面，保留主体场景，保持自然真实感）'
+      : '生成模式：text2img（无用户底图）'
+  return [
+    '请为当前编辑器草稿输出 ```json:cover``` 并走生图流程，生成小红书竖版封面（约 3:4）。',
+    modeLine,
+    '风格：倾向自然光或日常室内光、手机实拍/轻后期感、真实生活场景、留白给标题，像常见小红书笔记封面；避免赛博霓虹、过度 CG、炫光科技风、游戏/概念海报式的泛 AI 插画。',
+    '要求：直接输出可用的 json:cover（含 overlayText 等），完成生图并回填 imageUrl；封面大字须由模型绘入成图，客户端不合字。不要反问用户。',
+    `草稿标题：${title.trim() || '（空）'}`,
+    `封面叠字：${overlayText.trim() || title.trim() || '（请据标题生成）'}`,
+    `封面设计提示词（请严格参考）：${suggestion}`,
+  ].join('\n')
 }
 
 /** 原创度展示用合规分档（与质检维度无关） */
@@ -135,9 +201,10 @@ export default function XhsPostEditor({
   onSaveToKB: _onSaveToKB,
   onDraftChange,
   onSubmitQuality,
-  gatewayDisconnected: _gatewayDisconnected,
+  gatewayDisconnected = false,
   onResetDraftSession,
   onRequestStyleAnalysis,
+  onRequestCoverGeneration,
 }: Props) {
   const navigate = useNavigate()
   const { activeAccount, activeAccountId } = useActiveAccount()
@@ -198,7 +265,7 @@ export default function XhsPostEditor({
   const [aiPanelOpen, setAiPanelOpen] = useState(false)
   const [appliedSuggestionIds, setAppliedSuggestionIds] = useState<Record<string, boolean>>({})
   const [showDeepQualityLink, setShowDeepQualityLink] = useState(false)
-  const coverCompositeObjectUrlRef = useRef<string | null>(null)
+  const coverUploadObjectUrlRef = useRef<string | null>(null)
   const idleQualityTimerRef = useRef<number | null>(null)
   /** 基准草稿变更后用于重算 debounce 改写率 */
   const [originalitySessionTick, setOriginalitySessionTick] = useState(0)
@@ -206,6 +273,22 @@ export default function XhsPostEditor({
   const [debouncedRewriteRatio, setDebouncedRewriteRatio] = useState(0)
 
   const hasDraft = stage >= 2 && !!loadedDraft
+
+  const localCoverSuggestion = useMemo(
+    () => buildLocalCoverSuggestion(title, body, tags),
+    [title, body, tags],
+  )
+
+  const [coverGenSubmitting, setCoverGenSubmitting] = useState(false)
+
+  useEffect(() => {
+    const u =
+      loadedDraft?.cover?.imageUrl?.trim() ||
+      cover.imageUrl?.trim()
+    if (u && (/^https?:\/\//i.test(u) || u.startsWith('data:image/'))) {
+      setCoverGenSubmitting(false)
+    }
+  }, [loadedDraft?.cover?.imageUrl, cover.imageUrl])
 
   const portfolioSaveCount = useMemo(
     () => loadPosts(activeAccountId).length,
@@ -240,9 +323,9 @@ export default function XhsPostEditor({
     setSessionCreatedAt('')
     setDebouncedRewriteRatio(0)
     setCoverImageFile(null)
-    if (coverCompositeObjectUrlRef.current) {
-      URL.revokeObjectURL(coverCompositeObjectUrlRef.current)
-      coverCompositeObjectUrlRef.current = null
+    if (coverUploadObjectUrlRef.current) {
+      URL.revokeObjectURL(coverUploadObjectUrlRef.current)
+      coverUploadObjectUrlRef.current = null
     }
     originalDraftRef.current = null
     originalTitleRef.current = ''
@@ -259,9 +342,10 @@ export default function XhsPostEditor({
   const loadedDraftRef = useRef(loadedDraft)
   loadedDraftRef.current = loadedDraft
 
-  // Load stage2 draft：仅在新的草稿会话（draftSessionId）时整表初始化，不因 `json:cover` 单独到达而重置。
+  // Load stage2/3 draft：仅在新的草稿会话（draftSessionId）时整表初始化，不因 `json:cover` 单独到达而重置。
+  // stage 3 与 2 共用同一套表单数据；若仅在 stage 2 hydrate，网关残留的 score 会把 stage 顶到 3 导致永远不灌入正文。
   useEffect(() => {
-    if (stage !== 2) return
+    if (stage !== 2 && stage !== 3) return
     const ld = loadedDraftRef.current
     if (!ld) return
     if (editDebounceTimer.current) window.clearTimeout(editDebounceTimer.current)
@@ -286,9 +370,9 @@ export default function XhsPostEditor({
     setEditHistory([])
     setSessionCreatedAt(now)
     setCoverImageFile(null)
-    if (coverCompositeObjectUrlRef.current) {
-      URL.revokeObjectURL(coverCompositeObjectUrlRef.current)
-      coverCompositeObjectUrlRef.current = null
+    if (coverUploadObjectUrlRef.current) {
+      URL.revokeObjectURL(coverUploadObjectUrlRef.current)
+      coverUploadObjectUrlRef.current = null
     }
 
     originalDraftRef.current = ld
@@ -311,16 +395,30 @@ export default function XhsPostEditor({
 
   // 同一草稿会话内仅封面字段从父级更新（如晚到的 `json:cover`），不重置 postId / 编辑历史。
   useEffect(() => {
-    if (stage !== 2) return
+    if (stage !== 2 && stage !== 3) return
     if (!loadedDraft) return
     const c0 = loadedDraft.cover
-    setCover((prev) => ({
-      ...prev,
-      type: (c0.type as CoverType) ?? prev.type ?? 'photo',
-      description: c0.description ?? prev.description,
-      overlayText: c0.overlayText ?? prev.overlayText,
-      imageUrl: c0.imageUrl?.trim()?.length ? c0.imageUrl.trim() : prev.imageUrl,
-    }))
+    setCover((prev) => {
+      const prevUrl = prev.imageUrl ?? ''
+      const trimmedIncoming = c0.imageUrl?.trim()
+      const nextUrl =
+        trimmedIncoming && trimmedIncoming.length > 0 ? trimmedIncoming : prevUrl
+      if (
+        prevUrl.startsWith('blob:') &&
+        nextUrl !== prevUrl &&
+        coverUploadObjectUrlRef.current === prevUrl
+      ) {
+        URL.revokeObjectURL(prevUrl)
+        coverUploadObjectUrlRef.current = null
+      }
+      return {
+        ...prev,
+        type: (c0.type as CoverType) ?? prev.type ?? 'photo',
+        description: c0.description ?? prev.description,
+        overlayText: c0.overlayText ?? prev.overlayText,
+        imageUrl: nextUrl,
+      }
+    })
     originalCoverRef.current = loadedDraft.cover
   }, [
     stage,
@@ -382,23 +480,25 @@ export default function XhsPostEditor({
     return () => window.clearTimeout(t)
   }, [title, body, originalitySessionTick])
 
-  // 用户上传照片后：Canvas 合成封面预览（大字变更时重算）
+  // 用户上传照片后：原图 blob 预览（大字改不改图，由 json:cover 生图写入）
   useEffect(() => {
-    if (!coverImageFile) return
-    let cancelled = false
-    void generateCoverPreview(coverImageFile, cover.overlayText).then((blob) => {
-      if (cancelled || !blob) return
-      if (coverCompositeObjectUrlRef.current) {
-        URL.revokeObjectURL(coverCompositeObjectUrlRef.current)
+    if (!coverImageFile) {
+      if (coverUploadObjectUrlRef.current) {
+        URL.revokeObjectURL(coverUploadObjectUrlRef.current)
+        coverUploadObjectUrlRef.current = null
       }
-      const url = URL.createObjectURL(blob)
-      coverCompositeObjectUrlRef.current = url
-      setCover((c) => ({ ...c, imageUrl: url, type: 'photo' }))
-    })
-    return () => {
-      cancelled = true
+      return
     }
-  }, [coverImageFile, cover.overlayText])
+    const url = URL.createObjectURL(coverImageFile)
+    coverUploadObjectUrlRef.current = url
+    setCover((c) => ({ ...c, imageUrl: url, type: 'photo' }))
+    return () => {
+      URL.revokeObjectURL(url)
+      if (coverUploadObjectUrlRef.current === url) {
+        coverUploadObjectUrlRef.current = null
+      }
+    }
+  }, [coverImageFile])
 
   useEffect(() => {
     if (qualityScore) {
@@ -544,28 +644,7 @@ export default function XhsPostEditor({
     const history = applyPendingEditNow()
 
     const id = postId ?? uidForPost()
-    const rawForBake =
-      cover.imageUrl?.trim() ||
-      loadedDraft?.cover?.imageUrl?.trim() ||
-      ''
-    let storedImageUrl: string | undefined
-    if (
-      rawForBake &&
-      (rawForBake.startsWith('http://') ||
-        rawForBake.startsWith('https://') ||
-        rawForBake.startsWith('data:image/'))
-    ) {
-      const baked = await compositeCoverFromImageSource(rawForBake, cover.overlayText)
-      if (baked) {
-        const u = URL.createObjectURL(baked)
-        storedImageUrl = await persistableImageUrl(u)
-        revokeCoverObjectUrl(u)
-      } else {
-        storedImageUrl = await persistableImageUrl(cover.imageUrl)
-      }
-    } else {
-      storedImageUrl = await persistableImageUrl(cover.imageUrl)
-    }
+    const storedImageUrl = await persistableImageUrl(cover.imageUrl)
     const draft: Draft = {
       title,
       body,
@@ -637,22 +716,22 @@ export default function XhsPostEditor({
   }
 
   async function handleDownloadCover() {
-    const text = cover.overlayText
     let blob: Blob | null = null
-    if (coverImageFile) {
-      blob = await compositeCoverFromImageSource(coverImageFile, text)
-    } else {
-      const src = loadedDraft?.cover?.imageUrl?.trim() || cover.imageUrl?.trim() || ''
-      if (src.startsWith('http://') || src.startsWith('https://') || src.startsWith('data:image/')) {
-        blob = await compositeCoverFromImageSource(src, text)
-      } else if (src.startsWith('blob:')) {
-        try {
-          const res = await fetch(src)
-          blob = await res.blob()
-        } catch {
-          return
-        }
+    const src = cover.imageUrl?.trim() || loadedDraft?.cover?.imageUrl?.trim() || ''
+    if (
+      src.startsWith('http://') ||
+      src.startsWith('https://') ||
+      src.startsWith('blob:') ||
+      src.startsWith('data:image/')
+    ) {
+      try {
+        const res = await fetch(src)
+        blob = await res.blob()
+      } catch {
+        return
       }
+    } else if (coverImageFile) {
+      blob = coverImageFile
     }
     if (!blob) return
     const url = URL.createObjectURL(blob)
@@ -663,8 +742,38 @@ export default function XhsPostEditor({
     URL.revokeObjectURL(url)
   }
 
+  async function handleConfirmCoverGen() {
+    if (!onRequestCoverGeneration || gatewayDisconnected || coverGenSubmitting) return
+    const skillCoverDesc = (loadedDraft?.cover?.description ?? '').trim()
+    const suggestion = skillCoverDesc || buildCoverWireDesignPrompt(title, tags)
+    const mode = coverImageFile ? ('img2img' as const) : ('text2img' as const)
+    let imageDataUrl: string | undefined
+    if (coverImageFile) {
+      try {
+        imageDataUrl = await fileToDataUrl(coverImageFile)
+      } catch {
+        return
+      }
+    }
+    const wireMessage = composeCoverWireMessage({
+      title,
+      suggestion,
+      overlayText: cover.overlayText.trim() || title.trim(),
+      mode,
+    })
+    setCoverGenSubmitting(true)
+    onRequestCoverGeneration({
+      wireMessage,
+      imageDataUrl,
+      useUploadedImageAsCoverBase: !!coverImageFile,
+    })
+    window.setTimeout(() => setCoverGenSubmitting(false), 25_000)
+  }
+
   function renderCoverSlot() {
     const canEdit = stage < 4
+    const draftHasTextForCover =
+      title.trim().length > 0 || body.trim().replace(/\s+/g, '').length >= 8
     const hasDisplayImage = coverImageFile !== null || !!(cover.imageUrl && cover.imageUrl.trim().length > 0)
     const canDownloadCover =
       coverImageFile !== null ||
@@ -672,9 +781,9 @@ export default function XhsPostEditor({
     const skillCover = loadedDraft?.cover
     const suggestType =
       hasDisplayImage ? ('photo' as CoverType) : (skillCover?.type ?? cover.type)
-    const suggestDesc = (skillCover?.description ?? cover.description ?? '').trim() || '（暂无画面描述）'
+    const displaySuggestion =
+      (skillCover?.description ?? cover.description ?? '').trim() || localCoverSuggestion
     const overlayLen = (cover.overlayText || '').length
-    const overlayFontPx = Math.min(24, Math.max(14, 22 - Math.floor(overlayLen / 6)))
 
     return (
       <div className="flex min-w-0 flex-col gap-2">
@@ -696,12 +805,12 @@ export default function XhsPostEditor({
                   <div className="inline-flex rounded-full border border-white/60 bg-white/70 px-2.5 py-1 text-[11px] font-bold text-primary shadow-sm backdrop-blur-sm">
                     推荐类型 · {coverTypeLabel(suggestType)}
                   </div>
-                  <p className="rounded-lg border border-white/50 bg-white/65 px-2.5 py-2 text-[12px] leading-snug text-text-main shadow-sm backdrop-blur-sm">
-                    {suggestDesc}
+                  <p className="rounded-lg border border-white/50 bg-white/65 px-2.5 py-2 text-[12px] leading-snug text-text-main shadow-sm backdrop-blur-sm whitespace-pre-wrap">
+                    {displaySuggestion}
                   </p>
                   <div className="rounded-lg border border-white/60 bg-white/75 px-2 py-2.5 text-center shadow-sm backdrop-blur-sm">
                     <div className="text-[10px] font-semibold text-text-secondary">
-                      封面大字（来自 Skill，可上传后叠加）
+                      封面大字（随 json:cover 生图写入画面，可改后点确认生成）
                     </div>
                     <div
                       className="mt-1 font-bold text-text-main"
@@ -712,34 +821,41 @@ export default function XhsPostEditor({
                   </div>
                 </div>
                 <div className="rounded-lg border border-white/55 bg-white/60 py-2 text-center text-[11px] font-semibold text-text-main shadow-sm backdrop-blur-sm">
-                  上传你拍的照片作为封面
+                  {coverImageFile
+                    ? '已选照片作底图，确认后将走图生图（大字由 API 绘入成图）'
+                    : '可先上传照片作底图；成图仅经生图 API，客户端不合字'}
                 </div>
               </div>
             </>
           ) : (
-            <div className="flex w-full justify-center p-1">
-              <div className="relative inline-block max-w-full">
+            <div className="flex w-full flex-col gap-2 p-1">
+              <div className="flex w-full justify-center">
                 <img
                   src={cover.imageUrl}
                   alt="封面预览"
-                  className="block h-auto max-h-[min(85vh,640px)] w-auto max-w-full"
+                  className="block h-auto max-h-[min(85vh,640px)] w-auto max-w-full rounded-lg"
                 />
-                <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[38%] bg-gradient-to-t from-black/60 to-transparent" />
-                <div className="absolute inset-x-0 bottom-0 p-3">
+              </div>
+              {canEdit ? (
+                <div className="px-0.5">
+                  <label className="mb-1 block text-[10px] font-semibold text-text-secondary">
+                    封面大字（发送给生图 API，由模型绘入成图）
+                  </label>
                   <input
                     value={cover.overlayText}
                     onChange={(e) => {
-                      if (!canEdit) return
                       setCover((c) => ({ ...c, overlayText: e.target.value }))
                       recordEdit()
                     }}
-                    readOnly={!canEdit}
-                    placeholder="封面大字"
-                    className="pointer-events-auto w-full border-none bg-transparent text-center font-bold text-white outline-none placeholder:text-white/50"
-                    style={{ fontSize: `${overlayFontPx}px` }}
+                    placeholder="可据标题由模型生成，或自行填写"
+                    className="w-full rounded-lg border border-border-muted bg-surface px-2.5 py-2 text-[13px] font-semibold text-text-main outline-none focus:border-primary/40"
                   />
                 </div>
-              </div>
+              ) : (
+                <div className="rounded-lg border border-border-muted bg-surface/80 px-2.5 py-2 text-center text-[12px] font-semibold text-text-main">
+                  {cover.overlayText || '—'}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -768,6 +884,31 @@ export default function XhsPostEditor({
             >
               下载封面
             </button>
+          </div>
+        ) : null}
+
+        {canEdit && hasDraft && draftHasTextForCover && onRequestCoverGeneration ? (
+          <div className="rounded-xl border border-primary/25 bg-gradient-to-br from-primary/5 to-canvas px-3 py-2.5">
+            <div className="text-[11px] font-bold text-text-secondary">封面生图</div>
+            <p className="mt-1 text-[11px] leading-snug text-text-secondary">
+              左侧为画面建议与原图/成图预览；确认后向助手发送请求并输出 json:cover，大字由生图写入画面。
+            </p>
+            {coverImageFile ? (
+              <p className="mt-1 text-[10px] font-medium text-primary">已上传底图：将以该图为 img2img 底图</p>
+            ) : (
+              <p className="mt-1 text-[10px] text-text-tertiary">未上传照片时为文生图；先上传可用作底图</p>
+            )}
+            <button
+              type="button"
+              disabled={gatewayDisconnected || coverGenSubmitting}
+              onClick={() => void handleConfirmCoverGen()}
+              className="mt-2.5 w-full rounded-lg bg-primary px-3 py-2 text-center text-[12px] font-bold text-white shadow-sm transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {coverGenSubmitting ? '生成中，请稍候…' : '确认生成封面'}
+            </button>
+            {gatewayDisconnected ? (
+              <p className="mt-1 text-[10px] text-amber-700">网关未连接，无法请求生图</p>
+            ) : null}
           </div>
         ) : null}
       </div>

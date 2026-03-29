@@ -1,8 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useActiveAccount } from '../contexts/ActiveAccountContext'
-import { setPendingDraft } from '../lib/ideashuStorage'
-import type { Draft } from '../components/XhsPostEditor'
+import type { WorkspaceLocationState } from '../lib/workspaceLocationState'
 
 type Lifecycle = 'emerging' | 'hot' | 'peak' | 'declining'
 
@@ -86,28 +84,23 @@ const MOCK_SIGNALS: TrendSignal[] = [
   },
 ]
 
-function draftFromSignal(sig: TrendSignal): Draft {
-  const overlayText = sig.keyword
-  return {
-    title: `用 "${sig.keyword}" 写一篇高互动笔记`,
-    body: [
-      `我最近在看关于「${sig.keyword}」的内容，发现互动高的原因并不只是“热度”，而是大家在读的时候能代入到自己的场景。`,
-      `我准备从三个角度切入：\n- ${sig.suggestedAngles[0]}\n- ${sig.suggestedAngles[1]}\n- ${sig.suggestedAngles[2]}`,
-      '最后我会把真实体验写成一个可复用的小结，让读者看完就知道“下次怎么做”。',
-    ].join('\n\n'),
-    tags: [sig.keyword, '高互动写法', '体验记录'],
-    cover: {
-      type: 'photo',
-      description: '',
-      overlayText,
-      imageUrl: undefined,
-    },
-  }
+function uidNonce() {
+  const c = (globalThis as unknown as { crypto?: { randomUUID?: () => string } }).crypto
+  return c?.randomUUID?.() ?? `n_${Date.now()}_${Math.random().toString(16).slice(2)}`
+}
+
+/** 发到对话里，由 Skill 先问答再出稿；不预填右侧编辑器 */
+function messageFromSignal(sig: TrendSignal): string {
+  return [
+    `我想用「${sig.keyword}」方向写一篇更像真实笔记的内容：${sig.title}`,
+    `我最近在看关于「${sig.keyword}」的内容，发现互动高的原因并不只是“热度”，而是大家在读的时候能代入到自己的场景。`,
+    `我准备从三个角度切入：\n- ${sig.suggestedAngles[0]}\n- ${sig.suggestedAngles[1]}\n- ${sig.suggestedAngles[2]}`,
+    '请先问我 3 个最关键的素材问题，再进入 ideashu-v5 的写作流程。',
+  ].join('\n\n')
 }
 
 export default function HotBoardPage() {
   const navigate = useNavigate()
-  const { activeAccountId } = useActiveAccount()
   const [minHeat, setMinHeat] = useState(40)
   const [lifecycle, setLifecycle] = useState<Lifecycle | 'all'>('all')
   const [source, setSource] = useState<'all' | string>('all')
@@ -222,8 +215,11 @@ export default function HotBoardPage() {
                       <button
                         type="button"
                         onClick={() => {
-                          setPendingDraft(activeAccountId, draftFromSignal(sig))
-                          navigate('/workspace')
+                          const state: WorkspaceLocationState = {
+                            autoMessage: messageFromSignal(sig),
+                            nonce: uidNonce(),
+                          }
+                          navigate('/workspace', { state })
                         }}
                         className="px-4 py-2 rounded-lg bg-primary text-white font-semibold text-sm hover:bg-primary/90 transition-colors"
                       >

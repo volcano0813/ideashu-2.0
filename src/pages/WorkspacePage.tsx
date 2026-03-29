@@ -10,7 +10,7 @@ import XhsPostEditor, {
 } from '../components/XhsPostEditor'
 import { useActiveAccount, type AccountProfileInput } from '../contexts/ActiveAccountContext'
 import { stripAccountNameAsterisks } from '../lib/accounts'
-import { addMaterial, clearDraftSession, consumePendingDraft, loadDraftSession } from '../lib/ideashuStorage'
+import { addMaterial, clearDraftSession, consumePendingDraft, loadDraftSession, peekPendingDraft } from '../lib/ideashuStorage'
 import type { WorkspaceLocationState } from '../lib/workspaceLocationState'
 import { ensureOpenClawConnected, openclaw as sharedOpenclaw } from '../lib/openclawSingleton'
 import { type TrendSignal } from '../lib/openclawClient'
@@ -55,7 +55,7 @@ function mergeShortLinesToParagraphs(body: string): string {
     // 合并短行，但遇到语义转折点时分段
     const groups: string[][] = [[]]
     for (const line of lines) {
-      const currentGroup = groups[groups.length - 1]
+      const currentGroup = groups[groups.length - 1]!
       // 如果当前组已经有 3-4 句了，开新段
       if (currentGroup.length >= 4) {
         groups.push([line])
@@ -67,15 +67,16 @@ function mergeShortLinesToParagraphs(body: string): string {
     return groups
       .map((group) => {
         if (group.length <= 1) return group.join('')
-        let result = group[0]
+        let result = group[0] ?? ''
         for (let i = 1; i < group.length; i++) {
           const lastChar = result[result.length - 1] ?? ''
+          const curr = group[i] ?? ''
           if (/[。！？；…""''）》\.\!\?\;\)\>]/.test(lastChar)) {
-            result = result + group[i]
+            result = result + curr
           } else if (/[，、：,\:]/.test(lastChar)) {
-            result = result + group[i]
+            result = result + curr
           } else {
-            result = result + '，' + group[i]
+            result = result + '，' + curr
           }
         }
         return result
@@ -122,8 +123,14 @@ function deriveEditorStage(
   qualityScore: QualityScore | undefined,
 ): EditorStage {
   if (loadedDraft?.status === 'finalized') return 4
+  const hasDraft = !!(loadedDraft && draftHasMeaningfulContent(loadedDraft))
+  // 必须先识别「有正文草稿」再进质检态，否则仅有残留的 qualityScore 会让 stage=3，
+  // XhsPostEditor 只在 stage 2 做整表 hydrate，表现为「跳回工作台但编辑器空白」。
+  if (hasDraft) {
+    if (qualityScore !== undefined) return 3
+    return 2
+  }
   if (qualityScore !== undefined) return 3
-  if (loadedDraft && draftHasMeaningfulContent(loadedDraft)) return 2
   return 1
 }
 
@@ -131,14 +138,10 @@ export default function WorkspacePage() {
   const location = useLocation()
   const navigate = useNavigate()
   const openclaw = sharedOpenclaw
-  const { activeAccount, activeAccountId, patchActiveAccount, accounts, upsertAccountProfile } =
+  const { activeAccount, activeAccountId, patchActiveAccount, accounts, upsertAccountProfile, addAccount } =
     useActiveAccount()
 
   const syncedAccountNamesRef = useRef<Set<string>>(new Set())
-
-  useEffect(() => {
-    syncedAccountNamesRef.current.clear()
-  }, [activeAccountId])
 
   function stripMarkdownDecorations(raw: string): string {
     let s = stripAccountNameAsterisks(raw ?? '')
@@ -280,26 +283,90 @@ export default function WorkspacePage() {
     return [...merged.values()]
   }
 
+  function extractAccountNamesFromAssistantText(text: string): string[] {
+    const s = (text ?? '').replace(/\r\n/g, '\n')
+    if (!s.trim()) return []
+
+    // Strong gate: only attempt when the message is very likely about account configuration.
+    const gate =
+      /账号配置|已有配置|新建账号|账号\s*清单|账号\s*列表|领域|状态/.test(s) && /账号/.test(s)
+    if (!gate) return []
+
+    const out: string[] = []
+    const push = (name: string) => {
+      const n = stripMarkdownDecorations(name)
+      if (n.length < 2) return
+      if (['账号', '领域', '状态', '完成', '已有配置'].includes(n)) return
+      out.push(n)
+    }
+
+    const lines = s
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+
+    // 1) Markdown table: lines containing pipes.
+    const headerIdx = lines.findIndex((l) => l.includes('|') && l.includes('账号') && l.includes('领域'))
+    if (headerIdx >= 0) {
+      for (let i = headerIdx + 1; i < Math.min(lines.length, headerIdx + 12); i++) {
+        const l = lines[i]!
+        if (!l.includes('|')) continue
+        if (/---/.test(l)) continue
+        const cells = l.split('|').map((c) => c.trim()).filter((c) => c.length > 0)
+        const nameCell = cells[0]
+        if (nameCell) push(nameCell)
+      }
+    }
+
+    // 2) Plain text rows: a "账号 领域 状态" header then rows below.
+    const plainHeaderIdx = lines.findIndex(
+      (l) => !l.includes('|') && /账号/.test(l) && /领域/.test(l) && /状态/.test(l),
+    )
+    if (plainHeaderIdx >= 0) {
+      for (let i = plainHeaderIdx + 1; i < Math.min(lines.length, plainHeaderIdx + 12); i++) {
+        const l = lines[i]!
+        if (/^[-—_]{3,}$/.test(l)) continue
+        if (/配置完成|已有配置|检测到重复指令/.test(l)) continue
+        // Example: "Elia的AI实践 AI工具与产品实践 ✅ 20:02 完成"
+        const m = l.match(/^(\S{2,40})\s+/)
+        if (m?.[1]) push(m[1])
+      }
+    }
+
+    // 3) Fallback: "账号：xxx"
+    const re = /账号[:：]\s*([^\n，。]{2,40})/g
+    let m: RegExpExecArray | null
+    while ((m = re.exec(s)) !== null) {
+      push(m[1] ?? '')
+    }
+
+    return [...new Set(out)]
+  }
+
   function syncAccountsFromAssistantText(text: string) {
     const profiles = extractAccountProfilesFromAssistantText(text)
     const existingNames = new Set(accounts.map((a) => stripMarkdownDecorations(a.name)))
-    const activeName = stripMarkdownDecorations(activeAccount.name)
 
     if (profiles.length > 0) {
       for (const p of profiles) {
-        const parsedName = stripMarkdownDecorations(p.name)
-        if (!parsedName) continue
-        const targetName = existingNames.has(parsedName) ? parsedName : activeName
-        const dedupeKey =
-          targetName === parsedName ? parsedName : `${activeAccountId}:into-active:${parsedName}`
-        if (syncedAccountNamesRef.current.has(dedupeKey)) continue
-        syncedAccountNamesRef.current.add(dedupeKey)
-        upsertAccountProfile({ ...p, name: targetName })
+        const name = stripMarkdownDecorations(p.name)
+        if (!name) continue
+        // Prevent repeated writes on the same assistant bubble updates.
+        if (syncedAccountNamesRef.current.has(name)) continue
+        syncedAccountNamesRef.current.add(name)
+        upsertAccountProfile({ ...p, name })
       }
       return
     }
 
-    // 不再从助手纯文本里自动新建账号：未识别的名称易与当前 TopNav 账号不一致；有结构化字段时走上方 profile 并合并到当前账号。
+    // Fallback: still support name-only extraction.
+    const names = extractAccountNamesFromAssistantText(text)
+    for (const name of names) {
+      if (existingNames.has(name)) continue
+      if (syncedAccountNamesRef.current.has(name)) continue
+      syncedAccountNamesRef.current.add(name)
+      addAccount(name)
+    }
   }
 
   const [topicCards, setTopicCards] = useState<TopicCardModel[]>([])
@@ -307,8 +374,6 @@ export default function WorkspacePage() {
   const [connectAttempted, setConnectAttempted] = useState(false)
 
   const [loadedDraft, setLoadedDraft] = useState<Draft | undefined>(undefined)
-  /** Bumps only on new `json:draft` (or session restore), not on `json:cover` — keeps XhsPostEditor from resetting on late cover. */
-  const [draftSessionId, setDraftSessionId] = useState(0)
   const [originalDraft, setOriginalDraft] = useState<Draft | undefined>(undefined)
   const [qualityScore, setQualityScore] = useState<QualityScore | undefined>(undefined)
   const [originalityReport, setOriginalityReport] = useState<OriginalityReport | undefined>(undefined)
@@ -374,71 +439,117 @@ export default function WorkspacePage() {
     clearDraftSession(activeAccountId)
     currentDraftRef.current = undefined
     lastLocalImageDataUrlRef.current = null
-    setDraftSessionId((n) => n + 1)
     setLoadedDraft(undefined)
     setOriginalDraft(undefined)
     setQualityScore(undefined)
     setOriginalityReport(undefined)
   }
 
-  function resetPhaseZeroConfiguration() {
-    replyIdToMsgIdRef.current.clear()
-    msgId.current = 1
-    setMessages([])
-    setTopicCards([])
-    hasDraftInCurrentRoundRef.current = false
-    openclaw.resetAssistantStreamState()
-    patchActiveAccount({
-      domain: '未设置',
-      persona: '未设置',
-      styleName: '默认',
-      catchPhrases: [],
-      tone: '',
-      learnedRules: 0,
-      trendSources: 0,
-      hasAnalyzedStyle: false,
-      styleAnalysisCount: 0,
-      cumulativeEditCount: 0,
-    })
-    resetDraftSession()
-  }
+  // 必须在 OpenClaw 的 layout 订阅之前恢复草稿，否则残留的 score 事件会把 editorStage 顶到 3，
+  // 而编辑器只在 stage 2 灌入正文，表现为「跳回工作台无反应」。
+  useLayoutEffect(() => {
+    const st = location.state as WorkspaceLocationState | undefined
+    if (st?.autoMessage) return
+
+    let consumePendingCancelled = false
+
+    currentDraftRef.current = undefined
+    lastLocalImageDataUrlRef.current = null
+    setLoadedDraft(undefined)
+    setOriginalDraft(undefined)
+    setQualityScore(undefined)
+    setOriginalityReport(undefined)
+
+    const pending = peekPendingDraft(activeAccountId)
+    if (pending && draftHasMeaningfulContent(pending)) {
+      setLoadedDraft(pending)
+      setOriginalDraft(pending)
+      setQualityScore(undefined)
+      setOriginalityReport(undefined)
+      queueMicrotask(() => {
+        if (!consumePendingCancelled) consumePendingDraft(activeAccountId)
+      })
+    } else {
+      const session = loadDraftSession(activeAccountId)
+      if (session) {
+        setLoadedDraft(session.draft)
+        setOriginalDraft(session.originalDraft)
+      }
+    }
+
+    return () => {
+      consumePendingCancelled = true
+    }
+  }, [activeAccountId, location.key, navigate])
 
   useLayoutEffect(() => {
+    /** 判断助手正文是否应清空选题卡片（与卡片互斥展示） */
+    function assistantTextClearsTopicCards(text: string): boolean {
+      const trimmed = (text ?? '').trim()
+      if (!trimmed) return false
+      // 纯机器占位句不与选题卡片竞争
+      const norm = trimmed.replace(/\s+/g, ' ')
+      if (norm === '已生成结果（草稿/评分/原创度已更新）。') return false
+      return true
+    }
+
+    /** 检测 TrendSignal 是否为账号配置引导的误解析 */
+    function isAccountSetupFalsePositive(t: TrendSignal): boolean {
+      const title = (t.title ?? '').toLowerCase()
+      return /账号名|账号叫|内容领域|领域定位|阶段零|account\s*name|填空|什么名字|什么领域/.test(title)
+    }
+
     function applyAssistantReply(evt: { replyId: string; text: string }) {
       const text = evt.text
       const isTopicsPayload = isTopicsMachinePayload(text)
       syncAccountsFromAssistantText(text)
       const replyId = evt.replyId
+
+      // 有实质正文时，清空选题卡片（对话气泡与选题卡片互斥）
+      if (!isTopicsPayload && assistantTextClearsTopicCards(text)) {
+        setTopicCards([])
+      }
+
       setMessages((prev) => {
-        // Topics 机器载荷由选题卡片渲染，不进对话气泡，但也不删除已有消息
+        // Topics 机器载荷由选题卡片渲染，不进对话气泡
         if (isTopicsPayload) return prev
 
-        const existingMsgId = replyIdToMsgIdRef.current.get(replyId)
+        const textNorm = normalizeAgentBubbleText(text)
 
+        // 1. 同一 replyId 的消息 → 直接更新内容
+        const existingMsgId = replyIdToMsgIdRef.current.get(replyId)
         if (existingMsgId) {
           const existing = prev.find((m) => m.id === existingMsgId)
           if (existing) {
-            if (
-              existing.content === text ||
-              normalizeAgentBubbleText(existing.content) === normalizeAgentBubbleText(text)
-            ) {
-              return prev
-            }
+            if (normalizeAgentBubbleText(existing.content) === textNorm) return prev
             return prev.map((m) => (m.id === existingMsgId ? { ...m, content: text } : m))
           }
         }
 
-        // 去重：已有相同内容的助手消息则跳过
-        if (
-          prev.some(
-            (m) =>
-              m.role === 'agent' &&
-              normalizeAgentBubbleText(m.content) === normalizeAgentBubbleText(text),
-          )
-        ) {
+        // 2. 流式场景：新文本是某条已有助手消息的"更长版本"（包含它的内容）→ 更新那条
+        const supersetIdx = prev.findIndex(
+          (m) => m.role === 'agent' && textNorm.length > 0 &&
+            normalizeAgentBubbleText(m.content).length > 0 &&
+            (textNorm.includes(normalizeAgentBubbleText(m.content)) ||
+             normalizeAgentBubbleText(m.content).includes(textNorm))
+        )
+        if (supersetIdx >= 0) {
+          const target = prev[supersetIdx]!
+          // 保留更长的那个
+          const existingNorm = normalizeAgentBubbleText(target.content)
+          if (textNorm.length >= existingNorm.length) {
+            replyIdToMsgIdRef.current.set(replyId, target.id)
+            return prev.map((m, i) => (i === supersetIdx ? { ...m, content: text } : m))
+          }
           return prev
         }
 
+        // 3. 完全相同内容 → 跳过
+        if (prev.some((m) => m.role === 'agent' && normalizeAgentBubbleText(m.content) === textNorm)) {
+          return prev
+        }
+
+        // 4. 新消息
         const newId = nextMsgId()
         replyIdToMsgIdRef.current.set(replyId, newId)
         return [...prev, { id: newId, role: 'agent', content: text }]
@@ -457,7 +568,18 @@ export default function WorkspacePage() {
         if (currentDraftRef.current && draftHasMeaningfulContent(currentDraftRef.current)) {
           return
         }
-        setTopicCards(trendSignalsToTopicCards(evt.topics))
+        // 过滤假选题：
+        // 1. 真正的选题至少有 angle 或 heatScore 或 sourceUrl
+        // 2. 排除账号配置引导类的误解析（标题含"账号名""领域"等关键词）
+        const validTopics = (evt.topics ?? []).filter(
+          (t: TrendSignal) =>
+            !isAccountSetupFalsePositive(t) &&
+            ((t.angle && t.angle.length > 0) ||
+             (t.heatScore != null && t.heatScore > 0) ||
+             (t.sourceUrl && t.sourceUrl.length > 0))
+        )
+        if (validTopics.length === 0) return
+        setTopicCards(trendSignalsToTopicCards(validTopics))
         return
       }
 
@@ -471,7 +593,6 @@ export default function WorkspacePage() {
         // 收到草稿后立即清空选题卡片
         setTopicCards([])
 
-        const localImg = lastLocalImageDataUrlRef.current
         const evtDraft = evt.draft
 
         // 修复 Skill 返回的"一句一行"格式，合并为自然段落
@@ -480,23 +601,29 @@ export default function WorkspacePage() {
           body: mergeShortLinesToParagraphs(evtDraft.body),
         }
 
-        // 用户上传的图片注入封面：无论 Skill 返回什么封面类型，用户图片优先
+        // 封面图注入逻辑：
+        // 1. 如果 Skill 返回了 cover.imageUrl（来自 SiliconFlow 生图），使用 Skill 的
+        // 2. 如果 Skill 没返回 imageUrl 但用户上传了图片，注入用户的图片
+        // 3. 都没有则保持 Skill 返回的封面描述
+        const skillHasCoverImage = fixedDraft.cover?.imageUrl && fixedDraft.cover.imageUrl.length > 0
+        const localImg = lastLocalImageDataUrlRef.current
         const injectedDraft =
-          localImg
-            ? {
-                ...fixedDraft,
-                cover: {
-                  ...fixedDraft.cover,
-                  imageUrl: localImg,
-                  type: 'photo' as const,
-                },
-              }
-            : fixedDraft
+          skillHasCoverImage
+            ? fixedDraft  // Skill 生成了封面图，优先使用
+            : localImg
+              ? {
+                  ...fixedDraft,
+                  cover: {
+                    ...fixedDraft.cover,
+                    imageUrl: localImg,
+                    type: 'photo' as const,
+                  },
+                }
+              : fixedDraft
 
         const finalized = injectedDraft.status === 'finalized'
 
         if (finalized) {
-          setDraftSessionId((n) => n + 1)
           currentDraftRef.current = injectedDraft
           setLoadedDraft(injectedDraft)
           setOriginalDraft((prev) => prev ?? injectedDraft)
@@ -505,7 +632,6 @@ export default function WorkspacePage() {
 
         if (!draftHasMeaningfulContent(injectedDraft)) return
 
-        setDraftSessionId((n) => n + 1)
         currentDraftRef.current = injectedDraft
         setLoadedDraft(injectedDraft)
         setOriginalDraft((prev) => prev ?? injectedDraft)
@@ -540,8 +666,6 @@ export default function WorkspacePage() {
 
       if (evt.type === 'score') {
         setQualityScore(evt.score)
-        // After quality scoring starts, cover injection is no longer needed.
-        lastLocalImageDataUrlRef.current = null
         return
       }
 
@@ -570,7 +694,7 @@ export default function WorkspacePage() {
 
   async function handleSend(
     text: string,
-    options?: { imageDataUrl?: string; skipMaterialSave?: boolean },
+    options?: { imageDataUrl?: string; skipMaterialSave?: boolean; coverImg2img?: boolean },
   ) {
     const trimmed = text.trim()
     if (!trimmed && !options?.imageDataUrl) return
@@ -590,8 +714,24 @@ export default function WorkspacePage() {
 
     setTopicCards([])
 
+    // 检测是否是新建账号/换账号操作——此时不应附带当前账号上下文
+    const isAccountManagement = /新建账号|新建|换账号|换个账号|第一次用/.test(trimmed)
+
+    // 新建/换账号时，清空编辑器和相关状态
+    if (isAccountManagement) {
+      currentDraftRef.current = undefined
+      lastLocalImageDataUrlRef.current = null
+      setLoadedDraft(undefined)
+      setOriginalDraft(undefined)
+      setQualityScore(undefined)
+      setOriginalityReport(undefined)
+    }
+
     // 在发送给网关的消息前附带当前账号信息，让 Skill 知道用户在哪个账号下操作
-    const accountContext = `【当前创作账号：${activeAccount.name}（领域：${activeAccount.domain}）】\n`
+    // 但新建账号/换账号时不带，避免 Skill 误用当前账号的领域
+    const accountContext = isAccountManagement
+      ? ''
+      : `【当前创作账号：${activeAccount.name}（领域：${activeAccount.domain}）】\n`
 
     let wireText = trimmed
     if (options?.imageDataUrl && !options.skipMaterialSave) {
@@ -601,23 +741,29 @@ export default function WorkspacePage() {
         imageDataUrl: options.imageDataUrl,
         topicTags: ['聊天附带'],
       })
-      // 与飞书不同：网页网关当前只传文字。服务端要对用户图做 Kolors img2img 需网关传图或可被 Skill 拉取的临时 URL。
+      const coverHint = options.coverImg2img
+        ? '已自动设为封面底图。请使用 **img2img** 以该图为底生成竖版封面（约 3:4）：保留场景主体与构图，将大字标题绘入画面（应用侧不做本地叠字），保持自然真实、像小红书笔记实拍，避免赛博霓虹与过度 CG。请输出 ```json:cover``` 并完成生图。'
+        : '封面生成时请直接使用文生图模式生成封面，将大字标题绘入画面（应用侧不做本地叠字），倾向真实场景与轻后期、避免泛 AI 插画风，不要再问用户要图片。'
       wireText = trimmed
-        ? `${trimmed}\n\n【本地素材库已保存图片：${mat.id}】（网关仅传输文字；画面已写入本机「素材银行」）`
-        : `【本地素材库已保存图片：${mat.id}】请结合我上传的画面继续引导。（网关仅传输文字；画面已写入本机「素材银行」）`
+        ? `${trimmed}\n\n【本地素材库已保存图片：${mat.id}，${coverHint}】`
+        : `【本地素材库已保存图片：${mat.id}，${coverHint}】`
 
-      // 如果编辑器已有草稿，立即把用户图片注入封面（不等 Skill 返回 draft 事件）
+      // 如果编辑器已有草稿但没有封面图，注入用户上传的图片
+      // 如果草稿已有 Skill 生成的封面图（SiliconFlow），不覆盖
       if (currentDraftRef.current && draftHasMeaningfulContent(currentDraftRef.current)) {
-        const updatedDraft = {
-          ...currentDraftRef.current,
-          cover: {
-            ...currentDraftRef.current.cover,
-            imageUrl: options.imageDataUrl,
-            type: 'photo' as const,
-          },
+        const existingCoverUrl = currentDraftRef.current.cover?.imageUrl
+        if (!existingCoverUrl || existingCoverUrl.length === 0) {
+          const updatedDraft = {
+            ...currentDraftRef.current,
+            cover: {
+              ...currentDraftRef.current.cover,
+              imageUrl: options.imageDataUrl,
+              type: 'photo' as const,
+            },
+          }
+          currentDraftRef.current = updatedDraft
+          setLoadedDraft(updatedDraft)
         }
-        currentDraftRef.current = updatedDraft
-        setLoadedDraft(updatedDraft)
       }
     }
 
@@ -637,33 +783,16 @@ export default function WorkspacePage() {
     }
   }
 
-  // 灵感库 route state：自动发「帮我改」；否则 pending 草稿 / 本地会话恢复
+  // 灵感库 route state：自动发「帮我改」（草稿恢复已由上方 useLayoutEffect 处理）
   useEffect(() => {
     const st = location.state as WorkspaceLocationState | undefined
-    if (st?.autoMessage) {
-      const dedupeKey = st.nonce ?? st.sourceMaterialId ?? st.autoMessage
-      if (handledWorkspaceAutoNonces.has(dedupeKey)) return
-      handledWorkspaceAutoNonces.add(dedupeKey)
+    if (!st?.autoMessage) return
 
-      clearDraftSession(activeAccountId)
-      currentDraftRef.current = undefined
-      lastLocalImageDataUrlRef.current = null
-      setLoadedDraft(undefined)
-      setOriginalDraft(undefined)
-      setQualityScore(undefined)
-      setOriginalityReport(undefined)
+    const dedupeKey = st.nonce ?? st.sourceMaterialId ?? st.autoMessage
+    if (handledWorkspaceAutoNonces.has(dedupeKey)) return
+    handledWorkspaceAutoNonces.add(dedupeKey)
 
-      navigate('/workspace', { replace: true, state: {} })
-
-      const img = st.materialImage ?? undefined
-      if (img) lastLocalImageDataUrlRef.current = img
-
-      void handleSend(st.autoMessage, { imageDataUrl: img, skipMaterialSave: true })
-      return
-    }
-
-    // On account switch, always clear editor/session view first, then restore from account-scoped state.
-    openclaw.resetAssistantStreamState()
+    clearDraftSession(activeAccountId)
     currentDraftRef.current = undefined
     lastLocalImageDataUrlRef.current = null
     setLoadedDraft(undefined)
@@ -671,21 +800,13 @@ export default function WorkspacePage() {
     setQualityScore(undefined)
     setOriginalityReport(undefined)
 
-    const pending = consumePendingDraft(activeAccountId)
-    if (pending && draftHasMeaningfulContent(pending)) {
-      setDraftSessionId((n) => n + 1)
-      setLoadedDraft(pending)
-      setOriginalDraft(pending)
-      setQualityScore(undefined)
-      setOriginalityReport(undefined)
-      return
-    }
-    const session = loadDraftSession(activeAccountId)
-    if (!session) return
-    setDraftSessionId((n) => n + 1)
-    setLoadedDraft(session.draft)
-    setOriginalDraft(session.originalDraft)
-  }, [activeAccountId])
+    navigate('/workspace', { replace: true, state: {} })
+
+    const img = st.materialImage ?? undefined
+    if (img) lastLocalImageDataUrlRef.current = img
+
+    void handleSend(st.autoMessage, { imageDataUrl: img, skipMaterialSave: true })
+  }, [activeAccountId, location.key])
 
   function handleDeepQuality() {
     if (connectAttempted && gatewayReady && openclaw.isReady()) {
@@ -700,6 +821,18 @@ export default function WorkspacePage() {
     patchActiveAccount({
       hasAnalyzedStyle: true,
       styleAnalysisCount: (activeAccount.styleAnalysisCount ?? 0) + 1,
+    })
+  }
+
+  function handleRequestCoverFromEditor(args: {
+    wireMessage: string
+    imageDataUrl?: string
+    useUploadedImageAsCoverBase?: boolean
+  }) {
+    void handleSend(args.wireMessage, {
+      imageDataUrl: args.imageDataUrl,
+      skipMaterialSave: !args.useUploadedImageAsCoverBase,
+      coverImg2img: args.useUploadedImageAsCoverBase,
     })
   }
 
@@ -733,14 +866,12 @@ export default function WorkspacePage() {
             sending={sending}
             gatewayError={connectAttempted && !gatewayReady}
             accountName={activeAccount.name}
-            onResetPhaseZero={resetPhaseZeroConfiguration}
           />
         </aside>
 
         <section className="min-h-0 flex-1 overflow-hidden rounded-xl border border-border-muted bg-surface">
           <XhsPostEditor
             stage={editorStage}
-            draftSessionId={draftSessionId}
             loadedDraft={loadedDraft}
             originalDraft={originalDraft}
             originalityReport={originalityReport}
@@ -752,6 +883,7 @@ export default function WorkspacePage() {
             onResetDraftSession={resetDraftSession}
             gatewayDisconnected={connectAttempted && !gatewayReady}
             onRequestStyleAnalysis={handleRequestStyleAnalysis}
+            onRequestCoverGeneration={handleRequestCoverFromEditor}
           />
         </section>
       </div>

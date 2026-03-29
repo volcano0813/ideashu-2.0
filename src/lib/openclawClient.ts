@@ -1389,16 +1389,18 @@ export function createOpenClawClient({
   }
 
   function emitAssistantParse(raw: string, replyId: string): boolean {
+    // 可见文案 fingerprint 可能不变但 raw 变长（如 json:topics 续写）：只要 raw 变就重跑结构化解析，避免少发 topics。
+    const prevRawForReply = lastRawFullEmittedByReplyId.get(replyId)
+    if (raw !== prevRawForReply) {
+      emitJsonBlocksFromBuffer(raw, emit)
+    }
+
     const contentFp = normalizeAssistantRawForFingerprint(raw)
     if (contentFp.length > 0 && contentFp === lastEmittedAssistantContentFingerprint) {
+      lastRawFullEmittedByReplyId.set(replyId, raw)
       return false
     }
     lastEmittedAssistantContentFingerprint = contentFp
-
-    // Emit structured JSON-derived events first so Hotspot (and similar) can consume `topics`
-    // before `assistant_reply` and avoid treating a failed prose parse as final when json:topics
-    // is present in the same raw payload.
-    emitJsonBlocksFromBuffer(raw, emit)
 
     let displayText = stripMachineJsonFromChatDisplay(raw)
     displayText = collapseDoubledAssistantProse(displayText)
