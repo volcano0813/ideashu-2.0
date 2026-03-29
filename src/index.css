@@ -173,3 +173,32 @@ code {
     background-color: rgba(255, 255, 255, 0.14);
   }
 }
+
+/* 作品集卡片：正文旁半透明区域 + 右侧常驻细滚动条（侧滑） */
+.portfolio-card-scroll-side {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.22) rgba(255, 255, 255, 0.35);
+}
+.portfolio-card-scroll-side::-webkit-scrollbar {
+  width: 6px;
+}
+.portfolio-card-scroll-side::-webkit-scrollbar-track {
+  margin: 4px 0;
+  background: rgba(255, 255, 255, 0.42);
+  border-radius: 999px;
+}
+.portfolio-card-scroll-side::-webkit-scrollbar-thumb {
+  background-color: rgba(0, 0, 0, 0.2);
+  border-radius: 999px;
+}
+@media (prefers-color-scheme: dark) {
+  .portfolio-card-scroll-side {
+    scrollbar-color: rgba(255, 255, 255, 0.28) rgba(255, 255, 255, 0.08);
+  }
+  .portfolio-card-scroll-side::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.1);
+  }
+  .portfolio-card-scroll-side::-webkit-scrollbar-thumb {
+    background-color: rgba(255, 255, 255, 0.22);
+  }
+}

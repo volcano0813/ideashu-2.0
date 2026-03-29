@@ -14,6 +14,12 @@ const cardTints = [
 const CARD_R = '#FF2442'
 const CARD_R10 = 'rgba(255,36,66,0.06)'
 
+/**
+ * 仅按封面图高锁行高时，扁横图会使右侧「状态+标题+标签+按钮」挤占后正文区高度为 0。
+ * 行高取 max(图高, 本值)：高封面仍与图一致，过矮时略加高卡片，左图顶对齐、下方留白。
+ */
+const PORTFOLIO_ROW_MIN_FOR_BODY_PX = 280
+
 function hashString(input: string) {
   let h = 0
   for (let i = 0; i < input.length; i++) {
@@ -72,6 +78,11 @@ function PortfolioCard({
     return () => ro.disconnect()
   }, [coverUrl, coverBroken, post.id, syncCoverRowHeight])
 
+  const rowLayoutPx = useMemo(() => {
+    if (!hasCover || coverRowHeight == null) return null
+    return Math.max(coverRowHeight, PORTFOLIO_ROW_MIN_FOR_BODY_PX)
+  }, [hasCover, coverRowHeight])
+
   return (
     <div
       className="group relative min-w-0 w-full cursor-pointer overflow-hidden rounded-[14px] border border-border-muted bg-surface transition-[box-shadow] duration-200 shadow-[0_1px_3px_rgba(0,0,0,0.04)] hover:shadow-[0_6px_20px_rgba(0,0,0,0.06)]"
@@ -92,11 +103,11 @@ function PortfolioCard({
       <div
         className="flex min-h-0 min-w-0 flex-row items-stretch gap-0"
         style={
-          hasCover && coverRowHeight != null
-            ? { height: coverRowHeight, minHeight: coverRowHeight }
+          rowLayoutPx != null
+            ? { height: rowLayoutPx, minHeight: rowLayoutPx }
             : hasCover
               ? { minHeight: 80 }
-              : { minHeight: 120 }
+              : { minHeight: 160 }
         }
       >
         {/* 左：封面按比例完整展示（不裁切），宽上限约 1.5× 原 200px；行高由图高锁定 */}
@@ -132,9 +143,11 @@ function PortfolioCard({
             <div className="mt-1.5 text-[15px] font-black leading-snug text-text-main">{post.title}</div>
           </div>
 
-          <div className="portfolio-card-scroll mt-2 min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain">
-            <div className="text-[13.5px] leading-[1.6] tracking-[0.2px] text-text-secondary whitespace-pre-wrap break-words">
-              {post.body}
+          <div className="mt-2 flex min-h-0 flex-1 gap-1.5 overflow-hidden">
+            <div className="portfolio-card-body-pane portfolio-card-scroll-side min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-white/40 bg-white/45 px-2.5 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.5)] backdrop-blur-[2px] dark:border-white/10 dark:bg-black/25">
+              <div className="text-[13.5px] leading-[1.6] tracking-[0.2px] text-text-secondary whitespace-pre-wrap break-words">
+                {post.body || '\u00a0'}
+              </div>
             </div>
           </div>
 
